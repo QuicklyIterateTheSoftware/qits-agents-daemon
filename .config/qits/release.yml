@@ -1,0 +1,90 @@
+# qits-agents-daemon's release, copied from qits-workspace-daemon's and renamed: one tree, two
+# artifacts — the `qits/agent` image (the toolchain with this daemon as its entrypoint) and the
+# protocol jar qits-agents-service pins the image by.
+archetype: java-service
+artifacts:
+  # THE IMAGE. Its document is the one the release step exports from the same build (`--target
+  # sbom`), so it describes the very resolve that produced the binary inside.
+  - { type: docker, name: qits/agent, sbom: .sbom/sbom.json }
+  # THE PIN: `AgentImage.VERSION` is this jar's own version, filtered in at build time, so the jar's
+  # version IS the tag of the image published beside it. qits-agents-service depends on it. AFTER
+  # the image, always: a jar that resolves before its image exists is a pin pointing at nothing.
+  - { type: maven, name: "eu.wohlben.qits:qits-agents-daemon-protocol", path: agents-daemon-protocol, sbom: agents-daemon-protocol/target/sbom.json }
+
+# THE CONSUMER PACTS this daemon writes, flat in `pacts/`:
+#   qits-agents-service    the four runner doors, as the agent itself (AgentsServicePactTest);
+#   qits-projects-service  a repository's name by id, for an SCMPublishCommit without one
+#                          (ProjectsServicePactTest).
+# The platform packs each as eu.wohlben.qits:qits-agents-daemon-pacts-<provider> and publishes it
+# only when it changed. The daemon serves no HTTP, so it records no golden masters.
+contracts:
+  application: qits-agents-daemon
+  pacts:
+    qits-agents-service: { packages: [maven] }
+    qits-projects-service: { packages: [maven] }
+
+# AN IMAGE AND A JAR FROM ONE TREE, WHICH NO ARCHETYPE PUBLISHES, so both slots are declared here
+# and the archetype names the family only — qits-workspace-daemon's arrangement.
+release-request:
+  - image: qits/build-images/maven-base:latest
+    timeout-seconds: 1800
+    script: |
+      # THE ADDRESSES ARE CODE (qits-731): hosted Maven on registry.qits.<domain>, Central through
+      # mirror.qits.<domain>. `wohlben.eu` covers a qits-ci too old to inject $QITS_DOMAIN.
+      qits_domain=${QITS_DOMAIN:-wohlben.eu}
+      export QITS_MAVEN_CENTRAL_URL="https://mirror.qits.$qits_domain/mirror/maven/central"
+      export QITS_MAVEN_REPOSITORY_URL="https://registry.qits.$qits_domain/artifacts/maven/maven"
+      ./mvnw -B -ntp -s .qits-maven-settings.xml verify \
+        -Dqits.maven.repository.url="$QITS_MAVEN_REPOSITORY_URL"
+
+  - image: qits/build-images/ci-base:latest
+    build: true
+    timeout-seconds: 7200
+    script: |
+      # BYTE-IDENTICAL TO THE RELEASE SLOT'S BUILD but for the tag it pushes, so a release following
+      # a green fold is a stack of cache hits.
+      qits_domain=${QITS_DOMAIN:-wohlben.eu}
+      ref="registry.qits.$qits_domain/$QITS_IMAGE_REPOSITORY/agent:$QITS_CI_SHA"
+      buildctl build --frontend dockerfile.v0 \
+        --local context=. --local dockerfile=docker \
+        --opt build-arg:QITS_DOMAIN="$qits_domain" \
+        --secret id=qits-client-id,src=/tmp/qits-client-id \
+        --secret id=qits-client-secret,src=/tmp/qits-client-secret \
+        --output "type=image,name=$ref,push=true"
+
+release:
+  - image: qits/build-images/ci-base:latest
+    build: true
+    timeout-seconds: 7200
+    script: |
+      qits_domain=${QITS_DOMAIN:-wohlben.eu}
+      ref="registry.qits.$qits_domain/$QITS_IMAGE_REPOSITORY/agent:$QITS_VERSION"
+      buildctl build --frontend dockerfile.v0 \
+        --local context=. --local dockerfile=docker \
+        --opt build-arg:QITS_DOMAIN="$qits_domain" \
+        --secret id=qits-client-id,src=/tmp/qits-client-id \
+        --secret id=qits-client-secret,src=/tmp/qits-client-secret \
+        --output "type=image,name=$ref,push=true"
+
+      # GENERATED, NEVER SUBMITTED — the postlude PUTs it for the image entry. Same build args as the
+      # push above, so every layer is a cache hit.
+      buildctl build --frontend dockerfile.v0 \
+        --local context=. --local dockerfile=docker \
+        --opt target=sbom \
+        --opt build-arg:QITS_DOMAIN="$qits_domain" \
+        --secret id=qits-client-id,src=/tmp/qits-client-id \
+        --secret id=qits-client-secret,src=/tmp/qits-client-secret \
+        --output type=local,dest=.sbom
+
+  - image: qits/build-images/maven-base:latest
+    timeout-seconds: 1800
+    script: |
+      # The CLI publishes this coordinate from the postlude, off the jar this step leaves in
+      # target/. This step only has to build it.
+      ./mvnw -B -ntp -s .qits-maven-settings.xml -pl agents-daemon-protocol -am package -DskipTests
+      qits_domain=${QITS_DOMAIN:-wohlben.eu}
+      QITS_MAVEN_CENTRAL_URL="https://mirror.qits.$qits_domain/mirror/maven/central" \
+      ./mvnw -B -ntp -s .qits-maven-settings.xml -pl agents-daemon-protocol -DskipTests \
+        -Dqits.maven.repository.url="https://registry.qits.$qits_domain/artifacts/maven/maven" \
+        org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeBom \
+        -DoutputFormat=json -DoutputName=sbom -DschemaVersion=1.6
