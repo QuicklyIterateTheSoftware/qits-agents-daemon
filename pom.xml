@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- The reactor of qits-agents-daemon, the process inside a project's long-running agent
+         container (qits-2519). Shaped like qits-workspace-daemon's and qits-projects-daemon's roots:
+         the quarkus-bom import, the reactor's own protocol module, the released harness library,
+         and the compiler/surefire/quarkus plugin pins. The clone-alone rule holds: `./mvnw verify`
+         is green from this repository with Maven Central plus the platform's Maven registry. -->
+    <groupId>eu.wohlben.qits</groupId>
+    <artifactId>qits-agents-daemon-reactor</artifactId>
+    <version>2026.1124.0</version>
+    <packaging>pom</packaging>
+
+    <modules>
+        <!-- The pin: AgentImage.VERSION, the `qits/agent` tag qits-agents-service starts. -->
+        <module>agents-daemon-protocol</module>
+        <!-- The daemon itself, the image's entrypoint. -->
+        <module>agents-daemon</module>
+    </modules>
+
+    <properties>
+        <maven.compiler.release>25</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+        <quarkus.platform.artifact-id>quarkus-bom</quarkus.platform.artifact-id>
+        <quarkus.platform.group-id>io.quarkus.platform</quarkus.platform.group-id>
+        <quarkus.platform.version>3.40.1</quarkus.platform.version>
+
+        <compiler-plugin.version>3.15.0</compiler-plugin.version>
+        <surefire-plugin.version>3.5.4</surefire-plugin.version>
+
+        <!-- The shared harness library, released from qits-coding-agents. 2026.1123.182827 is the
+             release that added AgentSurface.PROJECT_AGENT (`project.agent`), the surface this
+             daemon's one kept session runs as. Exact pin; qits-maintenance bumps it. -->
+        <qits-coding-agents.version>2026.1123.182827</qits-coding-agents.version>
+
+        <!-- The consumer pact against qits-agents-service (test scope): pact-jvm, the platform's
+             shared golden-master reader, and what qits-agents-service answers in each provider
+             state. Exact pins; qits-maintenance bumps the qits-* coordinates. The agents golden masters
+             are published only when their content changes: 2026.1123.194720 is the newest jar, and
+             qits-agents-service 2026.1124.93938 records byte-identical ones. -->
+        <pact.version>4.7.5</pact.version>
+        <qits.pact-consumer.version>2026.1106.507</qits.pact-consumer.version>
+        <qits.agents-golden-masters.version>2026.1123.194720</qits.agents-golden-masters.version>
+        <qits.projects-golden-masters.version>2026.1122.200309</qits.projects-golden-masters.version>
+
+        <!-- Where the platform publishes it. Overridden by CI (-Dqits.maven.repository.url), derived
+             from QITS_DOMAIN; the default below is the public host. -->
+        <qits.maven.repository.url>https://registry.qits.wohlben.eu/artifacts/maven/maven</qits.maven.repository.url>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>${quarkus.platform.group-id}</groupId>
+                <artifactId>${quarkus.platform.artifact-id}</artifactId>
+                <version>${quarkus.platform.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>eu.wohlben.qits</groupId>
+                <artifactId>qits-agents-daemon-protocol</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>eu.wohlben.qits</groupId>
+                <artifactId>qits-commands</artifactId>
+                <version>${qits-coding-agents.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>eu.wohlben.qits</groupId>
+                <artifactId>qits-coding-agents</artifactId>
+                <version>${qits-coding-agents.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>au.com.dius.pact.consumer</groupId>
+                <artifactId>junit5</artifactId>
+                <version>${pact.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>eu.wohlben.qits</groupId>
+                <artifactId>qits-pact-consumer</artifactId>
+                <version>${qits.pact-consumer.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>eu.wohlben.qits</groupId>
+                <artifactId>qits-agents-golden-masters</artifactId>
+                <version>${qits.agents-golden-masters.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>eu.wohlben.qits</groupId>
+                <artifactId>qits-projects-golden-masters</artifactId>
+                <version>${qits.projects-golden-masters.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <!-- The platform's own Maven repository: the harness library, the pact reader and the golden
+         masters live only here. The id has to stay `qits-maven` — it is what
+         .qits-maven-settings.xml's exact-id mirror matches. -->
+    <repositories>
+        <repository>
+            <id>qits-maven</id>
+            <url>${qits.maven.repository.url}</url>
+        </repository>
+    </repositories>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>${quarkus.platform.group-id}</groupId>
+                    <artifactId>quarkus-maven-plugin</artifactId>
+                    <version>${quarkus.platform.version}</version>
+                </plugin>
+                <plugin>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>${compiler-plugin.version}</version>
+                    <configuration>
+                        <parameters>true</parameters>
+                    </configuration>
+                </plugin>
+                <plugin>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <version>${surefire-plugin.version}</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+</project>

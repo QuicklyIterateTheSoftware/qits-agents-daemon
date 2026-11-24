@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>eu.wohlben.qits</groupId>
+        <artifactId>qits-agents-daemon-reactor</artifactId>
+        <version>2026.1124.0</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <!-- PUBLISHED: qits-agents-service pins the `qits/agent` image by depending on this jar, and
+         reads the tag from AgentImage.VERSION. Plain Java, no dependencies, and nothing else in it:
+         the agent daemon speaks to qits-agents-service over REST doors that service owns, so there
+         is no wire contract to carry here. The name follows the estate's `<daemon>-protocol`
+         convention so qits-maintenance's bump treats it like its siblings
+         (qits-workspace-daemon-protocol, qits-projects-daemon-protocol). -->
+    <artifactId>qits-agents-daemon-protocol</artifactId>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!-- FILTERING IS ON FOR THIS MODULE'S ONE RESOURCE AND NOTHING ELSE, as in
+             qits-workspace-daemon-protocol. AgentImage refuses an unfiltered value, so switching
+             this off fails loudly rather than shipping the literal `${project.version}` as a tag. -->
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>true</filtering>
+                <includes>
+                    <include>eu/wohlben/qits/agentsdaemon/protocol/agent-image.properties</include>
+                </includes>
+            </resource>
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>false</filtering>
+                <excludes>
+                    <exclude>eu/wohlben/qits/agentsdaemon/protocol/agent-image.properties</exclude>
+                </excludes>
+            </resource>
+        </resources>
+        <plugins>
+            <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
