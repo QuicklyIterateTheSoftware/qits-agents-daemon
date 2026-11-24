@@ -1,0 +1,419 @@
+{
+  "consumer": {
+    "name": "qits-agents-daemon"
+  },
+  "interactions": [
+    {
+      "comments": {
+        "references": {
+          "qits-call": {
+            "app": "qits-agents-service",
+            "operationId": "markAgentTurnDelivered"
+          },
+          "qits-trigger": {
+            "app": "qits-agents-daemon",
+            "call": "a turn typed into the session",
+            "kind": "call"
+          }
+        }
+      },
+      "description": "a turn typed into the session: markAgentTurnDelivered",
+      "key": "882e113e",
+      "pending": false,
+      "providerStates": [
+        {
+          "name": "a running agent calling as itself",
+          "params": {
+            "authorization": "Bearer qits_tok_contract-developer",
+            "name": "developer",
+            "project": "qits",
+            "turnId": "00000000-0000-4000-8000-000000000001"
+          }
+        }
+      ],
+      "request": {
+        "generators": {
+          "header": {
+            "Authorization": {
+              "dataType": "RAW",
+              "expression": "${authorization}",
+              "type": "ProviderState"
+            }
+          },
+          "path": {
+            "dataType": "RAW",
+            "expression": "/agents/api/projects/${project}/agents/${name}/turns/${turnId}/delivered",
+            "type": "ProviderState"
+          }
+        },
+        "headers": {
+          "Authorization": [
+            "Bearer qits_tok_contract-developer"
+          ]
+        },
+        "method": "POST",
+        "path": "/agents/api/projects/qits/agents/developer/turns/00000000-0000-4000-8000-000000000001/delivered"
+      },
+      "response": {
+        "status": 204
+      },
+      "type": "Synchronous/HTTP"
+    },
+    {
+      "comments": {
+        "references": {
+          "qits-call": {
+            "app": "qits-agents-service",
+            "operationId": "listAgentTurns"
+          },
+          "qits-trigger": {
+            "app": "qits-agents-daemon",
+            "kind": "schedule",
+            "schedule": "every 10 s, and after a launch"
+          }
+        }
+      },
+      "description": "every 10 s, and after a launch: listAgentTurns",
+      "key": "e6377e1",
+      "pending": false,
+      "providerStates": [
+        {
+          "name": "a running agent calling as itself",
+          "params": {
+            "authorization": "Bearer qits_tok_contract-developer",
+            "name": "developer",
+            "project": "qits",
+            "turnId": "00000000-0000-4000-8000-000000000001"
+          }
+        }
+      ],
+      "request": {
+        "generators": {
+          "header": {
+            "Authorization": {
+              "dataType": "RAW",
+              "expression": "${authorization}",
+              "type": "ProviderState"
+            }
+          },
+          "path": {
+            "dataType": "RAW",
+            "expression": "/agents/api/projects/${project}/agents/${name}/turns",
+            "type": "ProviderState"
+          }
+        },
+        "headers": {
+          "Authorization": [
+            "Bearer qits_tok_contract-developer"
+          ]
+        },
+        "method": "GET",
+        "path": "/agents/api/projects/qits/agents/developer/turns"
+      },
+      "response": {
+        "body": {
+          "content": [
+            {
+              "createdAt": "2026-01-01T00:00:00Z",
+              "generation": 2,
+              "id": "00000000-0000-4000-8000-000000000001",
+              "kind": "RECOVERY",
+              "text": "You were restarted; read your claims and carry on."
+            }
+          ],
+          "contentType": "application/json",
+          "encoded": false
+        },
+        "headers": {
+          "Content-Type": [
+            "application/json"
+          ]
+        },
+        "matchingRules": {
+          "body": {
+            "$": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type",
+                  "min": 0
+                }
+              ]
+            },
+            "$[*].createdAt": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "regex",
+                  "regex": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(:\\d{2}(\\.\\d{1,9})?)?(Z|[+-]\\d{2}:?\\d{2})$"
+                }
+              ]
+            },
+            "$[*].generation": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "number"
+                }
+              ]
+            },
+            "$[*].id": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "regex",
+                  "regex": "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+                }
+              ]
+            },
+            "$[*].kind": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$[*].text": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            }
+          },
+          "header": {
+            "Content-Type": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "regex",
+                  "regex": "application/json.*"
+                }
+              ]
+            }
+          }
+        },
+        "status": 200
+      },
+      "type": "Synchronous/HTTP"
+    },
+    {
+      "comments": {
+        "references": {
+          "qits-call": {
+            "app": "qits-agents-service",
+            "operationId": "getAgentLaunch"
+          },
+          "qits-trigger": {
+            "app": "qits-agents-daemon",
+            "kind": "schedule",
+            "schedule": "every 30 s, and on ProjectAgentChanged"
+          }
+        }
+      },
+      "description": "every 30 s, and on ProjectAgentChanged: getAgentLaunch",
+      "key": "4bed4d77",
+      "pending": false,
+      "providerStates": [
+        {
+          "name": "a running agent calling as itself",
+          "params": {
+            "authorization": "Bearer qits_tok_contract-developer",
+            "name": "developer",
+            "project": "qits",
+            "turnId": "00000000-0000-4000-8000-000000000001"
+          }
+        }
+      ],
+      "request": {
+        "generators": {
+          "header": {
+            "Authorization": {
+              "dataType": "RAW",
+              "expression": "${authorization}",
+              "type": "ProviderState"
+            }
+          },
+          "path": {
+            "dataType": "RAW",
+            "expression": "/agents/api/projects/${project}/agents/${name}/launch",
+            "type": "ProviderState"
+          }
+        },
+        "headers": {
+          "Authorization": [
+            "Bearer qits_tok_contract-developer"
+          ]
+        },
+        "method": "GET",
+        "path": "/agents/api/projects/qits/agents/developer/launch"
+      },
+      "response": {
+        "body": {
+          "content": {
+            "brief": "You are the developer of the qits project.",
+            "effort": null,
+            "generation": 2,
+            "model": null,
+            "name": "developer",
+            "project": "qits",
+            "projectId": "00000000-0000-4000-8000-000000000002",
+            "sessionId": "session-contract"
+          },
+          "contentType": "application/json",
+          "encoded": false
+        },
+        "headers": {
+          "Content-Type": [
+            "application/json"
+          ]
+        },
+        "matchingRules": {
+          "body": {
+            "$.brief": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$.generation": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "number"
+                }
+              ]
+            },
+            "$.name": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$.project": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            },
+            "$.projectId": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "regex",
+                  "regex": "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+                }
+              ]
+            },
+            "$.sessionId": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            }
+          },
+          "header": {
+            "Content-Type": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "regex",
+                  "regex": "application/json.*"
+                }
+              ]
+            }
+          }
+        },
+        "status": 200
+      },
+      "type": "Synchronous/HTTP"
+    },
+    {
+      "comments": {
+        "references": {
+          "qits-call": {
+            "app": "qits-agents-service",
+            "operationId": "reportAgent"
+          },
+          "qits-trigger": {
+            "app": "qits-agents-daemon",
+            "event": "the session's state changed",
+            "kind": "event"
+          }
+        }
+      },
+      "description": "the session's state changed: reportAgent",
+      "key": "aeca869d",
+      "pending": false,
+      "providerStates": [
+        {
+          "name": "a running agent calling as itself",
+          "params": {
+            "authorization": "Bearer qits_tok_contract-developer",
+            "name": "developer",
+            "project": "qits",
+            "turnId": "00000000-0000-4000-8000-000000000001"
+          }
+        }
+      ],
+      "request": {
+        "body": {
+          "content": {
+            "generation": 2,
+            "sessionId": "session-contract",
+            "state": "BUSY"
+          },
+          "contentType": "application/json",
+          "encoded": false
+        },
+        "generators": {
+          "header": {
+            "Authorization": {
+              "dataType": "RAW",
+              "expression": "${authorization}",
+              "type": "ProviderState"
+            }
+          },
+          "path": {
+            "dataType": "RAW",
+            "expression": "/agents/api/projects/${project}/agents/${name}/report",
+            "type": "ProviderState"
+          }
+        },
+        "headers": {
+          "Authorization": [
+            "Bearer qits_tok_contract-developer"
+          ],
+          "Content-Type": [
+            "application/json"
+          ]
+        },
+        "method": "PUT",
+        "path": "/agents/api/projects/qits/agents/developer/report"
+      },
+      "response": {
+        "status": 204
+      },
+      "type": "Synchronous/HTTP"
+    }
+  ],
+  "metadata": {
+    "pactSpecification": {
+      "version": "4.0"
+    },
+    "plugins": []
+  },
+  "provider": {
+    "name": "qits-agents-service"
+  }
+}
