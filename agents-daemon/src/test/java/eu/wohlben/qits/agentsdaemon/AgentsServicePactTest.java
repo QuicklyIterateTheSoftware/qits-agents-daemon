@@ -21,7 +21,12 @@ import org.junit.jupiter.api.Test;
  *       and on {@code ProjectAgentChanged};
  *   <li>{@code listAgentTurns}: the undelivered turns, every 10 s and right after a launch;
  *   <li>{@code markAgentTurnDelivered}: once a turn was typed into the session;
- *   <li>{@code reportAgent}: on every session state change.
+ *   <li>{@code reportAgent}: on every session state change;
+ *   <li>{@code getAgent}: the row's {@code generation} and {@code recoveryPrompt}, when a fresh
+ *       session past the first generation owes its recovery prompt and no RECOVERY turn of that
+ *       generation is pending (one already acknowledged by a container that died). The provider
+ *       recorded it in {@value #ROW_STATE}, without a bearer; the door admits {@code qits:agent},
+ *       and the daemon sends its own bearer as on every call.
  * </ul>
  *
  * <p>Driven through the real {@link HttpAgentsDoors} against a pact mock server. The pact is {@code
@@ -59,8 +64,17 @@ class AgentsServicePactTest {
       GoldenInteraction.of(Trigger.event("the session's state changed"), STATE, "reportAgent")
           .header("Authorization", "{authorization}");
 
+  static final String ROW_STATE = "a running agent";
+
+  static final GoldenInteraction AGENT =
+      GoldenInteraction.of(
+              Trigger.event("a fresh session owes its generation's recovery prompt"),
+              ROW_STATE,
+              "getAgent")
+          .consumes("generation", "recoveryPrompt");
+
   static final ConsumerPact PACT =
-      ConsumerPact.of(CONSUMER, AGENTS, LAUNCH, TURNS, DELIVERED, REPORT);
+      ConsumerPact.of(CONSUMER, AGENTS, LAUNCH, TURNS, DELIVERED, REPORT, AGENT);
 
   @Test
   void theKeeperReadsTheLaunch() {
@@ -117,6 +131,25 @@ class AgentsServicePactTest {
   }
 
   @Test
+  void theKeeperReadsTheRecoveryPromptFromTheRow() {
+    PACT.run(
+        AGENT,
+        (url, recorded) -> {
+          var json = AGENTS.json(ROW_STATE, AGENT.operationId());
+          AgentsDoors.Agent agent =
+              new HttpAgentsDoors(
+                      HttpAgentsDoors.client(),
+                      url + "/agents",
+                      recorded.params().get("project"),
+                      recorded.params().get("name"),
+                      "qits_tok_contract-developer")
+                  .agent();
+          assertEquals(json.path("generation").asInt(), agent.generation());
+          assertEquals(json.path("recoveryPrompt").asText(), agent.recoveryPrompt());
+        });
+  }
+
+  @Test
   void theCommittedPactIsWhatTheRowsWrite() {
     PACT.compareOrWritePactFile();
   }
@@ -124,7 +157,7 @@ class AgentsServicePactTest {
   @Test
   void everyInteractionCarriesBothReferences() {
     PACT.assertEveryInteractionCarriesBothReferences();
-    assertEquals(4, PACT.recorded().size(), "every row is recorded: " + PACT.unrecorded());
+    assertEquals(5, PACT.recorded().size(), "every row is recorded: " + PACT.unrecorded());
   }
 
   /** The doors at the mock's {@code /agents}, with the state's bearer as the agent's token. */

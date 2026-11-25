@@ -46,6 +46,9 @@ public class AgentDaemon {
   static final long PROVISION_RETRY_MS = 30_000;
   static final long TERM_GRACE_MS = 5_000;
 
+  /** The {@link SessionLedger}, on the work volume (kept across containers), beside the checkout. */
+  static final String SESSION_LEDGER = ".qits-agents-daemon/sessions";
+
   @Inject Vertx vertx;
 
   private final ScheduledExecutorService boot = worker("agents-daemon-boot");
@@ -56,6 +59,7 @@ public class AgentDaemon {
   private volatile CommandRegistry registry;
   private volatile AgentTranscriptTailService tail;
   private volatile HookWebhook hooks;
+  private volatile AgentKeeper keeper;
   private volatile EventFollower events;
 
   void start() {
@@ -145,7 +149,9 @@ public class AgentDaemon {
             config.project(),
             config.agentName(),
             config.wrapper(),
-            follower::takeDetail);
+            follower::takeDetail,
+            SessionLedger.at(config.workspace().resolve(SESSION_LEDGER)));
+    this.keeper = keeper;
 
     HookWebhook webhook = new HookWebhook(vertx, config.hooksPort(), keeper::activity, launchService::onActivity);
     webhook.start();
@@ -222,6 +228,11 @@ public class AgentDaemon {
 
   @PreDestroy
   void stop() {
+    // First: once the sessions are being terminated, nothing typed into them may be acknowledged.
+    AgentKeeper k = keeper;
+    if (k != null) {
+      k.stop();
+    }
     EventFollower e = events;
     if (e != null) {
       e.stop();

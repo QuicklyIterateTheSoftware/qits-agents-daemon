@@ -4,8 +4,9 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * qits-agents-service's four runner doors, as this daemon calls them: always for its own agent and
- * always with its own bearer. The seam {@code AgentKeeper} is tested through.
+ * qits-agents-service's four runner doors, and the agent's own row, as this daemon calls them:
+ * always for its own agent and always with its own bearer. The seam {@code AgentKeeper} is tested
+ * through.
  */
 interface AgentsDoors {
 
@@ -48,6 +49,14 @@ interface AgentsDoors {
     static final String FAILED = "FAILED";
   }
 
+  /** What the agent's row says of its current generation: the recovery prompt a fresh session begins with. */
+  record Agent(int generation, String recoveryPrompt) {
+
+    public Agent {
+      recoveryPrompt = recoveryPrompt == null ? "" : recoveryPrompt;
+    }
+  }
+
   /** {@code launch} answered 409: the agent is RETIRED (or holds no credential yet). */
   final class Retired extends RuntimeException {
     public Retired(String message) {
@@ -77,4 +86,7 @@ interface AgentsDoors {
 
   /** {@code PUT /projects/{p}/agents/{name}/report}. */
   void report(Report report);
+
+  /** {@code GET /projects/{p}/agents/{name}}: the row, for its generation's recovery prompt. */
+  Agent agent();
 }

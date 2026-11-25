@@ -8,6 +8,93 @@
         "references": {
           "qits-call": {
             "app": "qits-agents-service",
+            "operationId": "getAgent"
+          },
+          "qits-trigger": {
+            "app": "qits-agents-daemon",
+            "event": "a fresh session owes its generation's recovery prompt",
+            "kind": "event"
+          }
+        }
+      },
+      "description": "a fresh session owes its generation's recovery prompt: getAgent",
+      "key": "3662571c",
+      "pending": false,
+      "providerStates": [
+        {
+          "name": "a running agent",
+          "params": {
+            "name": "developer",
+            "project": "qits",
+            "turnId": "00000000-0000-4000-8000-000000000001"
+          }
+        }
+      ],
+      "request": {
+        "generators": {
+          "path": {
+            "dataType": "RAW",
+            "expression": "/agents/api/projects/${project}/agents/${name}",
+            "type": "ProviderState"
+          }
+        },
+        "method": "GET",
+        "path": "/agents/api/projects/qits/agents/developer"
+      },
+      "response": {
+        "body": {
+          "content": {
+            "generation": 2,
+            "recoveryPrompt": "You were restarted; read your claims and carry on."
+          },
+          "contentType": "application/json",
+          "encoded": false
+        },
+        "headers": {
+          "Content-Type": [
+            "application/json"
+          ]
+        },
+        "matchingRules": {
+          "body": {
+            "$.generation": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "number"
+                }
+              ]
+            },
+            "$.recoveryPrompt": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ]
+            }
+          },
+          "header": {
+            "Content-Type": {
+              "combine": "AND",
+              "matchers": [
+                {
+                  "match": "regex",
+                  "regex": "application/json.*"
+                }
+              ]
+            }
+          }
+        },
+        "status": 200
+      },
+      "type": "Synchronous/HTTP"
+    },
+    {
+      "comments": {
+        "references": {
+          "qits-call": {
+            "app": "qits-agents-service",
             "operationId": "markAgentTurnDelivered"
           },
           "qits-trigger": {

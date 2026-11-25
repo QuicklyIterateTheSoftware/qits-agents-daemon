@@ -15,7 +15,7 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * The four doors over the JDK's HTTP client, at {@code <serviceUrl>/api} — {@code
+ * The doors over the JDK's HTTP client, at {@code <serviceUrl>/api} — {@code
  * QITS_AGENTS_DAEMON_SERVICE_URL} is {@code https://agents.qits.<domain>/agents}, the public edge.
  * Every call carries {@code Authorization: Bearer $QITS_TOKEN}, the agent's own commissioned token,
  * which the doors admit for the agent's own row.
@@ -113,6 +113,12 @@ final class HttpAgentsDoors implements AgentsDoors {
             .PUT(HttpRequest.BodyPublishers.ofString(body.encode()))
             .build();
     expect(send(request), 204, "report");
+  }
+
+  @Override
+  public Agent agent() {
+    JsonObject body = object(expect(send(get("")), 200, "agent"));
+    return new Agent(body.getInteger("generation", 0), body.getString("recoveryPrompt"));
   }
 
   private HttpRequest get(String path) {

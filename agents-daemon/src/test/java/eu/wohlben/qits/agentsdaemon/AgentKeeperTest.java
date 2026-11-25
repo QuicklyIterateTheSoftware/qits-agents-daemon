@@ -18,7 +18,10 @@ import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.UUID;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /** The keeper against a fake launch service and fake doors, on a hand-driven clock. */
 class AgentKeeperTest {
@@ -28,17 +31,24 @@ class AgentKeeperTest {
   final FakeDoors doors = new FakeDoors();
   final FakeHarness harness = new FakeHarness();
   final ManualScheduler scheduler = new ManualScheduler();
-  final AgentKeeper keeper =
-      new AgentKeeper(
-          doors,
-          harness,
-          scheduler,
-          scheduler::now,
-          AgentKeeper.Timing.DEFAULT,
-          "qits",
-          "developer",
-          "qits-qits",
-          () -> null);
+  /** The work volume's ledger: it outlives a keeper, as the volume outlives a container. */
+  final SessionLedger ledger = SessionLedger.inMemory();
+  final AgentKeeper keeper = keeper(harness);
+
+  /** A keeper as a (new) container starts one, over the same doors and the same work volume. */
+  AgentKeeper keeper(FakeHarness on) {
+    return new AgentKeeper(
+        doors,
+        on,
+        scheduler,
+        scheduler::now,
+        AgentKeeper.Timing.DEFAULT,
+        "qits",
+        "developer",
+        "qits-qits",
+        () -> null,
+        ledger);
+  }
 
   @Test
   void aRelaunchAfterAnExitResumesTheSessionId() {
@@ -76,6 +86,7 @@ class AgentKeeperTest {
   void aNewerGenerationGivesAFreshSessionWhoseFirstTurnIsRecovery() {
     doors.launch = launch(1, "session-1");
     harness.transcripts.add("session-1");
+    ledger.record("session-1", 1);
     keeper.refresh();
     assertEquals("session-1", harness.plans.getFirst().request().resumeSessionId());
 
@@ -92,12 +103,194 @@ class AgentKeeperTest {
 
     keeper.onActivity("cmd-2", "IDLE", "session-2");
     assertEquals(List.of("cmd-2:You were restarted."), harness.typed);
-    assertEquals(List.of(recovery), doors.delivered);
+    assertTrue(doors.delivered.isEmpty(), "typed is not taken: acknowledged on the session's BUSY");
 
     keeper.onActivity("cmd-2", "BUSY", null);
+    assertEquals(List.of(recovery), doors.delivered);
     keeper.onActivity("cmd-2", "IDLE", null);
     assertEquals(List.of("cmd-2:You were restarted.", "cmd-2:Take qits-1."), harness.typed);
+    keeper.onActivity("cmd-2", "BUSY", null);
     assertEquals(List.of(recovery, assigned), doors.delivered);
+    assertEquals(0, doors.agentReads, "the pending RECOVERY turn is the prompt; the row is not read");
+  }
+
+  @Test
+  void aContainerStartWithASessionOfAnOlderGenerationStartsFreshWithRecoveryFirst() {
+    // The work volume says session-2 is generation 2's; launch still names it at generation 3.
+    ledger.record("session-2", 2);
+    harness.transcripts.add("session-2");
+    doors.launch = launch(3, "session-2");
+    UUID assigned = doors.turn(3, "ASSIGNED", "Take qits-1.", "2026-01-01T00:00:01Z");
+    UUID recovery = doors.turn(3, "RECOVERY", "You were restarted.", "2026-01-01T00:00:03Z");
+
+    keeper.refresh();
+
+    assertNull(harness.plans.getFirst().request().resumeSessionId(), "never generation 2's session");
+    assertEquals(new AgentsDoors.Report(3, "STARTING", null, null), doors.reports.getFirst());
+    keeper.onActivity("cmd-1", "IDLE", "session-3");
+    keeper.onActivity("cmd-1", "BUSY", "session-3");
+    keeper.onActivity("cmd-1", "IDLE", "session-3");
+    keeper.onActivity("cmd-1", "BUSY", "session-3");
+
+    assertEquals(List.of("cmd-1:You were restarted.", "cmd-1:Take qits-1."), harness.typed);
+    assertEquals(List.of(recovery, assigned), doors.delivered);
+    assertEquals(3, ledger.generationOf("session-3").getAsInt());
+    assertNeverPaired(3, "session-2");
+  }
+
+  @Test
+  void aContainerStartWithASessionOfTheSameGenerationResumesItAndRetypesNothing() {
+    ledger.record("session-3", 3);
+    harness.transcripts.add("session-3");
+    doors.launch = launch(3, "session-3");
+    UUID recovery = doors.turn(3, "RECOVERY", "You were restarted.", "2026-01-01T00:00:03Z");
+    doors.deliveredSet.add(recovery); // the earlier container's session took it
+
+    keeper.refresh();
+    keeper.onActivity("cmd-1", "IDLE", "session-3");
+    keeper.pollTurns();
+
+    assertEquals("session-3", harness.plans.getFirst().request().resumeSessionId());
+    assertTrue(harness.typed.isEmpty(), "a resumed session already has its recovery");
+    assertEquals(0, doors.agentReads);
+    assertEquals(new AgentsDoors.Report(3, "IDLE", "session-3", null), doors.reports.getLast());
+  }
+
+  @Test
+  void aSessionTheLedgerDoesNotKnowIsNotResumed() {
+    harness.transcripts.add("session-2");
+    doors.launch = launch(2, "session-2");
+
+    keeper.refresh();
+
+    assertNull(harness.plans.getFirst().request().resumeSessionId(), "launch.sessionId alone is not trusted");
+  }
+
+  /**
+   * The live generation 2 → 3 change of 2026-11-25: the old container typed RECOVERY into its fresh
+   * session and was stopped before the session took it; a new container starts at generation 3 with
+   * launch still naming generation 2's session.
+   */
+  @Test
+  void aRecoveryTheDyingContainerTypedIsNotAcknowledgedAndTheNextFreshSessionGetsIt() {
+    ledger.record("session-2", 2);
+    harness.transcripts.add("session-2");
+    doors.launch = launch(2, "session-2");
+    keeper.refresh();
+    keeper.onActivity("cmd-1", "IDLE", "session-2");
+
+    doors.launch = launch(3, "session-2");
+    UUID recovery = doors.turn(3, "RECOVERY", "You were restarted.", "2026-01-01T00:00:03Z");
+    keeper.refresh();
+    keeper.onActivity("cmd-2", "IDLE", "session-3");
+    assertEquals(List.of("cmd-2:You were restarted."), harness.typed);
+    keeper.stop(); // SIGTERM: the container is replaced
+    keeper.onActivity("cmd-2", "BUSY", "session-3");
+    keeper.pollTurns();
+    assertTrue(doors.delivered.isEmpty(), "never acknowledged: the session did not take it in time");
+
+    FakeHarness next = new FakeHarness();
+    next.transcripts.add("session-2");
+    AgentKeeper replaced = keeper(next);
+    replaced.refresh();
+    assertNull(next.plans.getFirst().request().resumeSessionId());
+    replaced.onActivity("cmd-1", "IDLE", "session-4");
+    assertEquals(List.of("cmd-1:You were restarted."), next.typed);
+    replaced.onActivity("cmd-1", "BUSY", "session-4");
+    assertEquals(List.of(recovery), doors.delivered);
+    assertNeverPaired(3, "session-2");
+  }
+
+  @Test
+  void aRecoveryAlreadyAcknowledgedIsStillTypedIntoTheFreshSession() {
+    ledger.record("session-2", 2);
+    doors.launch = launch(3, "session-2");
+    doors.recoveryPrompt = "You were restarted; read your claims.";
+    UUID recovery = doors.turn(3, "RECOVERY", "You were restarted; read your claims.", "2026-01-01T00:00:03Z");
+    doors.deliveredSet.add(recovery); // acknowledged by a container that died
+    UUID assigned = doors.turn(3, "ASSIGNED", "Take qits-1.", "2026-01-01T00:00:04Z");
+
+    keeper.refresh();
+    keeper.onActivity("cmd-1", "IDLE", "session-3");
+    assertEquals(List.of("cmd-1:You were restarted; read your claims."), harness.typed, "recovery first");
+    keeper.pollTurns();
+    assertEquals(1, harness.typed.size(), "nothing else while the prompt is not taken");
+    keeper.onActivity("cmd-1", "BUSY", "session-3");
+    keeper.onActivity("cmd-1", "IDLE", "session-3");
+    keeper.onActivity("cmd-1", "BUSY", "session-3");
+    keeper.onActivity("cmd-1", "IDLE", "session-3");
+
+    assertEquals(
+        List.of("cmd-1:You were restarted; read your claims.", "cmd-1:Take qits-1."), harness.typed);
+    assertEquals(List.of(assigned), doors.delivered);
+    assertEquals(1, doors.agentReads);
+  }
+
+  @Test
+  void aPendingRecoveryOfTheGenerationIsNotRetypedOnceTheRowsPromptWasTaken() {
+    doors.launch = launch(3, null);
+    doors.failTurns = true; // the inbox does not answer at first
+    keeper.refresh();
+    keeper.onActivity("cmd-1", "IDLE", "session-3");
+    keeper.onActivity("cmd-1", "BUSY", "session-3");
+    assertEquals(List.of("cmd-1:Recover."), harness.typed);
+
+    doors.failTurns = false;
+    UUID recovery = doors.turn(3, "RECOVERY", "Recover.", "2026-01-01T00:00:03Z");
+    keeper.onActivity("cmd-1", "IDLE", "session-3");
+    keeper.pollTurns();
+
+    assertEquals(List.of("cmd-1:Recover."), harness.typed, "typed once");
+    assertEquals(List.of(recovery), doors.delivered, "its text reached the session: acknowledged");
+  }
+
+  @Test
+  void aShutdownDuringAFlushAcknowledgesNothing() {
+    doors.launch = launch(1, null);
+    doors.turn(1, "COMMENTED", "Hello.", "2026-01-01T00:00:01Z");
+    keeper.refresh();
+    harness.onType = keeper::stop; // SIGTERM arrives while the turn is being typed
+
+    keeper.onActivity("cmd-1", "IDLE", "session-1");
+    int reports = doors.reports.size();
+    keeper.onActivity("cmd-1", "BUSY", "session-1");
+    keeper.pollTurns();
+    keeper.refresh();
+    scheduler.advance(600_000);
+
+    assertEquals(List.of("cmd-1:Hello."), harness.typed);
+    assertTrue(doors.delivered.isEmpty());
+    assertEquals(reports, doors.reports.size(), "a stopping daemon reports nothing");
+    assertEquals(1, harness.plans.size(), "nor launches");
+  }
+
+  @Test
+  void aTurnTypedIntoASessionThatExitsBeforeTakingItIsTypedAgainIntoTheNext() {
+    doors.launch = launch(1, null);
+    UUID hello = doors.turn(1, "COMMENTED", "Hello.", "2026-01-01T00:00:01Z");
+    keeper.refresh();
+    keeper.onActivity("cmd-1", "IDLE", "session-1");
+    harness.transcripts.add("session-1");
+    harness.exit("cmd-1", 1);
+    keeper.watch();
+    keeper.onActivity("cmd-1", "BUSY", "session-1"); // a late hook of the exited command
+    assertTrue(doors.delivered.isEmpty());
+
+    scheduler.advance(5_000);
+    keeper.onActivity("cmd-2", "IDLE", "session-1");
+    keeper.onActivity("cmd-2", "BUSY", "session-1");
+
+    assertEquals("session-1", harness.plans.get(1).request().resumeSessionId());
+    assertEquals(List.of("cmd-1:Hello.", "cmd-2:Hello."), harness.typed);
+    assertEquals(List.of(hello), doors.delivered);
+  }
+
+  private void assertNeverPaired(int generation, String session) {
+    for (AgentsDoors.Report report : doors.reports) {
+      assertTrue(
+          report.generation() != generation || !session.equals(report.sessionId()),
+          "reported " + report);
+    }
   }
 
   @Test
@@ -123,6 +316,23 @@ class AgentKeeperTest {
         "each typed once, RECOVERY first");
     assertEquals(List.of(recovery, assigned, commented), doors.delivered, "each acknowledged once");
     assertTrue(doors.pending().isEmpty());
+  }
+
+  @Test
+  void theLedgerOnTheWorkVolumeOutlivesTheContainer(@TempDir Path volume) throws Exception {
+    Path file = volume.resolve(AgentDaemon.SESSION_LEDGER);
+    SessionLedger.at(file).record("session-2", 2);
+    SessionLedger.at(file).record("session-3", 3);
+
+    SessionLedger read = SessionLedger.at(file);
+    assertEquals(2, read.generationOf("session-2").getAsInt());
+    assertEquals(3, read.generationOf("session-3").getAsInt());
+    assertTrue(read.generationOf("session-9").isEmpty());
+    for (int i = 0; i < SessionLedger.KEEP + 5; i++) {
+      read.record("s-" + i, 4);
+    }
+    assertTrue(SessionLedger.at(file).generationOf("session-2").isEmpty(), "the oldest fall out");
+    assertEquals(SessionLedger.KEEP, Files.readAllLines(file).size());
   }
 
   @Test
@@ -212,6 +422,9 @@ class AgentKeeperTest {
     Launch launch;
     boolean retired;
     boolean failNextDelivered;
+    boolean failTurns;
+    String recoveryPrompt = "Recover.";
+    int agentReads;
     final List<Turn> turns = new ArrayList<>();
     final Set<UUID> deliveredSet = new HashSet<>();
     final List<UUID> delivered = new ArrayList<>();
@@ -240,7 +453,16 @@ class AgentKeeperTest {
 
     @Override
     public List<Turn> pendingTurns() {
+      if (failTurns) {
+        throw new Unavailable("turns answered 502");
+      }
       return pending();
+    }
+
+    @Override
+    public Agent agent() {
+      agentReads++;
+      return new Agent(launch.generation(), recoveryPrompt);
     }
 
     @Override
@@ -268,6 +490,7 @@ class AgentKeeperTest {
     final List<String> terminated = new ArrayList<>();
     final List<String> typed = new ArrayList<>();
     boolean failNext;
+    Runnable onType = () -> {};
 
     void exit(String commandId, int code) {
       exited.put(commandId, code);
@@ -315,6 +538,7 @@ class AgentKeeperTest {
       if (exited.containsKey(commandId)) {
         return GuardedInput.NOT_RUNNING;
       }
+      onType.run();
       typed.add(commandId + ":" + text);
       return GuardedInput.WRITTEN;
     }

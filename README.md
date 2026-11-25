@@ -70,12 +70,24 @@ effort, and an appended system prompt of the overseer brief followed by the laun
 
 - `launch` is read at start, every 30 s and on every `ProjectAgentChanged` for this agent.
 - A crash relaunches on a ladder (5 s doubling to 5 min, reset after 10 min up, never giving up),
-  resuming `launch.sessionId` when its transcript is on `/claude-home`.
+  resuming `launch.sessionId` (else the last session seen) only when the **session ledger** places
+  it at the launch's generation and its transcript is on `/claude-home`. The ledger,
+  `/workspace/.qits-agents-daemon/sessions` on the kept work volume, records `<generation>
+  <sessionId>` for every session the daemon launched for a generation, so a new container never
+  resumes the previous generation's session that `launch.sessionId` may still name.
 - A newer generation ends the session and launches a fresh one; RECOVERY is its first turn.
+- Every fresh session past generation 1 begins with its generation's recovery prompt: the pending
+  RECOVERY turn of that generation, else the row's `recoveryPrompt` (`GET .../agents/{name}`) when
+  the RECOVERY turn was already acknowledged. Typed once per session.
 - Turns (read every 10 s and after a launch) are typed one at a time at the session's idle, RECOVERY
-  first then by `createdAt`, and each is acknowledged once with `delivered`.
+  first then by `createdAt`. A typed turn is acknowledged with `delivered` only once the session
+  took it (its `UserPromptSubmit` hook, BUSY, for that command) at the running generation; nothing
+  else is typed meanwhile, and a session that ends first leaves the turn pending for the next one.
 - Reports: STARTING at launch, IDLE/BUSY from the harness hooks (loopback webhook on 127.0.0.1:13337),
-  EXITED or FAILED on exit, always with the running generation and session id.
+  EXITED or FAILED on exit, always with the running generation and a session id the ledger does not
+  place at another generation.
+- On container stop the keeper stops first: nothing is typed, acknowledged, reported or launched
+  while the sessions are terminated.
 - `launch` answering 409 (RETIRED) stops the session; the daemon idles and keeps reading `launch`.
 
 **OverseerBrief.** The platform-owned half of the system prompt: the checkout follows every commit
@@ -97,7 +109,14 @@ after 60 s of silence, and followed by a full catch-up (backstop + `launch`) aft
 | `INFO OriginPush pushed <R> <branch> <sha7>` | a branch reached origin |
 | `WARN OriginPush refused <R> <branch>: <first line>` | the host said no; retried only on a new tip |
 | `INFO AgentKeeper launched <command> at generation <n> (fresh\|resuming <id>)` | a session started |
-| `INFO AgentKeeper typed <KIND> turn <id> into <command>` | a turn was delivered |
+| `INFO AgentKeeper typed <KIND> turn <id> into <command>` | a turn was typed into the session |
+| `INFO AgentKeeper typed the generation <n> recovery prompt into <command> (from the agent's row)` | a fresh session's recovery prompt, its RECOVERY turn already acknowledged |
+| `INFO AgentKeeper: <command> took the generation <n> recovery prompt` | the session submitted it |
+| `INFO AgentKeeper acknowledged <KIND> turn <id>` | `delivered` landed, after the session took the turn |
+| `INFO AgentKeeper: <what> typed into <command> was not taken; it stays pending` | the session ended first |
+| `INFO AgentKeeper: not resuming <id> at generation <n>: it belongs to <generation m\|no generation this daemon recorded>` | `launch.sessionId` is not this generation's |
+| `INFO SessionLedger recorded <id> at generation <n>` | a session placed at its generation |
+| `INFO AgentKeeper stopping: no turn is acknowledged from now on` | the container is stopping |
 | `INFO AgentKeeper: session <command> exited (exit <n>; relaunching in <s> s)` | a crash, on the ladder |
 | `INFO AgentKeeper: the agent is retired (...)` | `launch` answered 409 |
 | `INFO EventFollower connected to <url>` | the event stream is up |
@@ -105,6 +124,6 @@ after 60 s of silence, and followed by a full catch-up (backstop + `launch`) aft
 ## Contracts
 
 Consumer pacts, flat in `pacts/`: `qits-agents-daemon_qits-agents-service.json` (the four doors, in
-the provider state `a running agent calling as itself`) and
+the provider state `a running agent calling as itself`, and `getAgent` in `a running agent`) and
 `qits-agents-daemon_qits-projects-service.json` (`getRepository`). The daemon serves no HTTP and
 records no golden masters.
