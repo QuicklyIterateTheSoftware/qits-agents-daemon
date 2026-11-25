@@ -524,6 +524,11 @@ class AgentKeeperTest {
     }
 
     @Override
+    public void usage(UsageReport report) {
+      // the keeper never reports usage
+    }
+
+    @Override
     public Agent agent() {
       agentReads++;
       return new Agent(launch.generation(), recoveryPrompt);

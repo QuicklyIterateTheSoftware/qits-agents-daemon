@@ -142,8 +142,8 @@ final class AgentKeeper {
   private volatile AgentsDoors.Launch launch;
   private boolean retired;
   private volatile String commandId;
-  private int runningGeneration = -1;
-  private String sessionId;
+  private volatile int runningGeneration = -1;
+  private volatile String sessionId;
   private long launchedAt;
   private long backoffMs;
   /** Bumped on every launch and stop, so a relaunch scheduled before is void. */
@@ -251,6 +251,16 @@ final class AgentKeeper {
   String projectId() {
     AgentsDoors.Launch current = launch;
     return current == null || current.projectId() == null ? null : current.projectId().toString();
+  }
+
+  /** The running session's id, once known; else the last one, or null. */
+  String sessionId() {
+    return sessionId;
+  }
+
+  /** The generation of the running (or last) session; -1 before the first launch. */
+  int generation() {
+    return runningGeneration;
   }
 
   /** The command id of the running session, or null. */

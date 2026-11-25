@@ -21,8 +21,11 @@ import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import java.net.http.HttpClient;
+import java.nio.file.Path;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -31,7 +34,7 @@ import org.jboss.logging.Logger;
 /**
  * Wires the container's parts and starts them, in order: the checkout (provisioned once), the
  * harness library over it, the hook webhook, the {@link AgentKeeper}, the {@link MainFollower}'s
- * backstop, the {@link OriginPush} cycle and the event stream.
+ * backstop, the {@link OriginPush} cycle, the {@link UsageScanner} and the event stream.
  *
  * <p>A container missing its environment logs what is missing and idles rather than dying: the
  * runner would only restart it into the same state.
@@ -55,6 +58,7 @@ public class AgentDaemon {
   private final ScheduledExecutorService follow = worker("agents-daemon-follow");
   private final ScheduledExecutorService push = worker("agents-daemon-push");
   private final ScheduledExecutorService keep = worker("agents-daemon-keeper");
+  private final ScheduledExecutorService usage = worker("agents-daemon-usage");
 
   private volatile CommandRegistry registry;
   private volatile AgentTranscriptTailService tail;
@@ -139,6 +143,7 @@ public class AgentDaemon {
 
     AgentsDoors doors =
         new HttpAgentsDoors(http, config.serviceUrl(), config.project(), config.agentName(), config.token());
+    SessionLedger ledger = SessionLedger.at(config.workspace().resolve(SESSION_LEDGER));
     AgentKeeper keeper =
         new AgentKeeper(
             doors,
@@ -150,7 +155,7 @@ public class AgentDaemon {
             config.agentName(),
             config.wrapper(),
             follower::takeDetail,
-            SessionLedger.at(config.workspace().resolve(SESSION_LEDGER)));
+            ledger);
     this.keeper = keeper;
 
     HookWebhook webhook = new HookWebhook(vertx, config.hooksPort(), keeper::activity, launchService::onActivity);
@@ -160,6 +165,22 @@ public class AgentDaemon {
 
     follow.scheduleWithFixedDelay(guarded("follower", follower::backstop), 0, FOLLOW_BACKSTOP_MS, TimeUnit.MILLISECONDS);
     push.scheduleWithFixedDelay(guarded("push", pusher::cycle), PUSH_POLL_MS, PUSH_POLL_MS, TimeUnit.MILLISECONDS);
+
+    UsageScanner scanner =
+        new UsageScanner(
+            Path.of(config.claudeMount(), ".claude", "projects"),
+            () -> {
+              // The running session, and the earlier ones of its generation.
+              Set<String> sessions = new LinkedHashSet<>(ledger.sessionsAt(keeper.generation()));
+              String current = keeper.sessionId();
+              if (current != null) {
+                sessions.add(current);
+              }
+              return sessions;
+            },
+            doors);
+    usage.scheduleWithFixedDelay(
+        guarded("usage", scanner::tick), UsageScanner.POLL_MS, UsageScanner.POLL_MS, TimeUnit.MILLISECONDS);
 
     RepositoryNames names = new RepositoryNames(http, config.projectsUrl(), config.token());
     EventFollower follower0 =
@@ -253,5 +274,6 @@ public class AgentDaemon {
     follow.shutdownNow();
     push.shutdownNow();
     keep.shutdownNow();
+    usage.shutdownNow();
   }
 }

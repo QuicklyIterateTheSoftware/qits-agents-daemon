@@ -116,6 +116,30 @@ final class HttpAgentsDoors implements AgentsDoors {
   }
 
   @Override
+  public void usage(UsageReport report) {
+    JsonArray messages = new JsonArray();
+    for (UsageMessage message : report.messages()) {
+      messages.add(
+          new JsonObject()
+              .put("messageId", message.messageId())
+              .put("workQualifiedId", message.workQualifiedId())
+              .put("model", message.model())
+              .put("inputTokens", message.inputTokens())
+              .put("outputTokens", message.outputTokens())
+              .put("cacheCreationTokens", message.cacheCreationTokens())
+              .put("cacheReadTokens", message.cacheReadTokens())
+              .put("at", message.at() == null ? null : message.at().toString()));
+    }
+    JsonObject body = new JsonObject().put("sessionId", report.sessionId()).put("messages", messages);
+    HttpRequest request =
+        base("/usage")
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(body.encode()))
+            .build();
+    expect(send(request), 204, "usage");
+  }
+
+  @Override
   public Agent agent() {
     JsonObject body = object(expect(send(get("")), 200, "agent"));
     return new Agent(body.getInteger("generation", 0), body.getString("recoveryPrompt"));

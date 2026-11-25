@@ -76,6 +76,17 @@ final class SessionLedger {
     return generation == null ? OptionalInt.empty() : OptionalInt.of(generation);
   }
 
+  /** The sessions this ledger places at {@code generation}, oldest first. */
+  synchronized List<String> sessionsAt(int generation) {
+    List<String> sessions = new ArrayList<>();
+    for (Map.Entry<String, Integer> entry : entries.entrySet()) {
+      if (entry.getValue() == generation) {
+        sessions.add(entry.getKey());
+      }
+    }
+    return sessions;
+  }
+
   /** Records that {@code sessionId} belongs to {@code generation}. */
   synchronized void record(String sessionId, int generation) {
     if (sessionId == null || sessionId.isBlank()) {

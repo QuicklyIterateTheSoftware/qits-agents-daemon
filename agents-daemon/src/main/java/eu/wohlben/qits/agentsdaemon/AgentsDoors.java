@@ -1,12 +1,13 @@
 package eu.wohlben.qits.agentsdaemon;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
 /**
- * qits-agents-service's four runner doors, and the agent's own row, as this daemon calls them:
- * always for its own agent and always with its own bearer. The seam {@code AgentKeeper} is tested
- * through.
+ * qits-agents-service's four runner doors, its usage door, and the agent's own row, as this
+ * daemon calls them: always for its own agent and always with its own bearer. The seam {@code
+ * AgentKeeper} and {@code UsageScanner} are tested through.
  */
 interface AgentsDoors {
 
@@ -57,6 +58,27 @@ interface AgentsDoors {
     }
   }
 
+  /**
+   * One assistant message of the agent's transcripts, counted once per session: its token usage,
+   * the work item its working directory names ({@code workQualifiedId}, null for the agent's own
+   * overhead) and its time.
+   */
+  record UsageMessage(
+      String messageId,
+      String workQualifiedId,
+      String model,
+      long inputTokens,
+      long outputTokens,
+      long cacheCreationTokens,
+      long cacheReadTokens,
+      Instant at) {}
+
+  /** One call of the usage door: at most {@value #MAX} messages of one session. */
+  record UsageReport(String sessionId, List<UsageMessage> messages) {
+
+    static final int MAX = 500;
+  }
+
   /** {@code launch} answered 409: the agent is RETIRED (or holds no credential yet). */
   final class Retired extends RuntimeException {
     public Retired(String message) {
@@ -86,6 +108,12 @@ interface AgentsDoors {
 
   /** {@code PUT /projects/{p}/agents/{name}/report}. */
   void report(Report report);
+
+  /**
+   * {@code POST /projects/{p}/agents/{name}/usage}: idempotent on {@code (sessionId, messageId)},
+   * so a batch may be sent again.
+   */
+  void usage(UsageReport report);
 
   /** {@code GET /projects/{p}/agents/{name}}: the row, for its generation's recovery prompt. */
   Agent agent();

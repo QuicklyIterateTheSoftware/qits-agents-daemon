@@ -93,6 +93,16 @@ effort, and an appended system prompt of the overseer brief followed by the laun
   while the sessions are terminated.
 - `launch` answering 409 (RETIRED) stops the session; the daemon idles and keeps reading `launch`.
 
+**UsageScanner.** Every 60 s, for the running session and every earlier session the ledger places at
+the running generation: reads `/claude-home/.claude/projects/*/<sessionId>.jsonl` and its
+`<sessionId>/subagents/agent-*.jsonl` from the offset it reached (complete lines only), takes each
+assistant `message.id`'s usage once per session (the first line wins; a missing number is 0), and
+posts the new messages in batches of at most 500 to `POST .../agents/{name}/usage` with the agent's
+bearer. A message whose `cwd` is under `/workspace/worktrees/<qualified id>/` is attributed to that
+item, anything else is null (the overseer's own overhead). Offsets live in memory and move only once
+the session's batches were accepted: a failed call is retried whole on the next tick, and a new
+container rescans from 0; the door's dedupe on `(sessionId, messageId)` absorbs the repeats.
+
 **OverseerBrief.** The platform-owned half of the system prompt: the checkout follows every commit
 and is read-only; each item gets worktrees under `/workspace/worktrees/<qualified id>/`; a subagent
 does the work; pushes happen automatically; worktrees are removed through the repository that made
@@ -125,6 +135,8 @@ after 60 s of silence, and followed by a full catch-up (backstop + `launch`) aft
 | `INFO AgentKeeper: session <command> exited (exit <n>; relaunching in <s> s)` | a crash, on the ladder |
 | `INFO AgentKeeper: the agent is retired (...)` | `launch` answered 409 |
 | `INFO EventFollower connected to <url>` | the event stream is up |
+| `WARN UsageScanner: reporting usage failed (<why>); retrying every 60 s` | the usage door refused or was unreachable; once per streak |
+| `INFO UsageScanner: the usage door accepts reports again` | the streak ended |
 
 ## Contracts
 
