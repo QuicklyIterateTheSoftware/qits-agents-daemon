@@ -54,6 +54,9 @@ import org.jboss.logging.Logger;
  *       the session took it — its {@code UserPromptSubmit} hook (BUSY) for that command — while
  *       the session is still the running generation's and the daemon is not stopping. Until then
  *       nothing else is typed; a session that ends first leaves the turn pending, for the next one.
+ *       Not taken within {@code takeTimeoutMs} (120 s) while the session idles: typed again, at most
+ *       {@value #TAKE_TRIES} times in all; then left pending, named in the next report's detail, and
+ *       the session goes on with the turns after it.
  *   <li><b>Report</b>: STARTING at launch, IDLE/BUSY from the harness hooks, EXITED or FAILED on
  *       exit, always with the running generation and a session id the ledger does not place at
  *       another generation.
@@ -84,10 +87,15 @@ final class AgentKeeper {
       long launchPollMs,
       long turnsPollMs,
       long watchMs,
-      long startGraceMs) {
+      long startGraceMs,
+      long takeTimeoutMs) {
 
-    static final Timing DEFAULT = new Timing(5_000, 300_000, 600_000, 30_000, 10_000, 2_000, 30_000);
+    static final Timing DEFAULT =
+        new Timing(5_000, 300_000, 600_000, 30_000, 10_000, 2_000, 30_000, 120_000);
   }
+
+  /** How often one thing is typed into one session before it is left pending. */
+  static final int TAKE_TRIES = 3;
 
   /** What one launch asks the harness library for. */
   record Plan(AgentLaunchRequest request, AgentSurfaceConfiguration configuration, int generation) {}
@@ -161,12 +169,28 @@ final class AgentKeeper {
    * Typed into {@code commandId} at {@code generation}: a turn of the inbox, or (turn null) the
    * row's recovery prompt; {@code recovery} when it is that generation's recovery prompt.
    */
-  private record InFlight(String commandId, AgentsDoors.Turn turn, boolean recovery, int generation) {
+  private record InFlight(
+      String commandId, AgentsDoors.Turn turn, boolean recovery, int generation, long typedAt) {
 
     String what() {
       return turn == null ? "the recovery prompt" : turn.kind() + " turn " + turn.id();
     }
+
+    String key() {
+      return turn == null ? "recovery-" + generation : turn.id().toString();
+    }
+
+    String notTaken() {
+      return (turn == null ? "recovery prompt" : "turn " + turn.id()) + " not taken after " + TAKE_TRIES + " tries";
+    }
   }
+
+  /** Times each thing was typed into the running session, by {@link InFlight#key}. */
+  private final Map<String, Integer> tries = new java.util.HashMap<>();
+  /** Typed {@value #TAKE_TRIES} times into the running session and never taken: left pending. */
+  private final Set<String> givenUp = new HashSet<>();
+  /** A detail the next report carries, once. */
+  private String owedDetail;
 
   AgentKeeper(
       AgentsDoors doors,
@@ -352,6 +376,8 @@ final class AgentKeeper {
       queue.clear();
     }
     inFlight = null;
+    tries.clear();
+    givenUp.clear();
     runningGeneration = generation;
     sessionId = resume;
     // A fresh session knows nothing: past the first generation it begins with the recovery prompt.
@@ -487,6 +513,9 @@ final class AgentKeeper {
       if (inFlight != null && inFlight.turn() != null && inFlight.turn().id().equals(turn.id())) {
         continue; // typed, not yet taken
       }
+      if (givenUp.contains(turn.id().toString())) {
+        continue; // never taken by this session: left pending, for the next one
+      }
       if (recoveryTaken(turn)) {
         // This session already took its generation's recovery prompt: the same text, not retyped.
         taken.add(turn.id());
@@ -539,7 +568,10 @@ final class AgentKeeper {
    * still taking the last one: the recovery prompt a fresh session owes, else the first queued turn.
    */
   private void flushOne() {
-    if (stopping || commandId == null || !AgentsDoors.Report.IDLE.equals(activity) || inFlight != null) {
+    if (stopping || commandId == null || !AgentsDoors.Report.IDLE.equals(activity)) {
+      return;
+    }
+    if (inFlight != null && !untake()) {
       return;
     }
     if (launch == null || launch.generation() != runningGeneration) {
@@ -563,13 +595,53 @@ final class AgentKeeper {
     }
   }
 
+  /**
+   * What is in flight was not taken within {@code takeTimeoutMs} while the session sits idle: put
+   * back to be typed again, or — after {@value #TAKE_TRIES} tries — left pending and named on the
+   * next report. True when nothing is in flight any more.
+   */
+  private boolean untake() {
+    InFlight typed = inFlight;
+    long waited = clock.getAsLong() - typed.typedAt();
+    if (waited < timing.takeTimeoutMs()) {
+      return false;
+    }
+    inFlight = null;
+    typedAt = -1;
+    if (tries.getOrDefault(typed.key(), 0) >= TAKE_TRIES) {
+      givenUp.add(typed.key());
+      if (typed.recovery()) {
+        recoveryOwed = -1; // the session goes on without it; the next fresh one owes it again
+      }
+      LOG.warnf(
+          "AgentKeeper: %s typed into %s was not taken after %d tries; left pending",
+          typed.what(), typed.commandId(), TAKE_TRIES);
+      owedDetail = typed.notTaken();
+      report(AgentsDoors.Report.IDLE, null);
+      return true;
+    }
+    LOG.warnf(
+        "AgentKeeper: %s typed into %s was not taken within %d s; typing it again",
+        typed.what(), typed.commandId(), timing.takeTimeoutMs() / 1000);
+    if (typed.turn() != null) {
+      queue.removeIf(t -> t.id().equals(typed.turn().id()));
+      queue.addFirst(typed.turn()); // first again; a RECOVERY one is still what flushOne owes
+    }
+    // A recovery prompt from the row: recoveryOwed was never cleared, so it is typed again.
+    return true;
+  }
+
   private void typeTurn(AgentsDoors.Turn turn, boolean recovery) {
+    if (givenUp.contains(turn.id().toString())) {
+      return;
+    }
     if (!type(turn.text(), turn.id().toString())) {
       return;
     }
     queue.remove(turn);
-    inFlight = new InFlight(commandId, turn, recovery, runningGeneration);
     typedAt = clock.getAsLong();
+    inFlight = new InFlight(commandId, turn, recovery, runningGeneration, typedAt);
+    tries.merge(inFlight.key(), 1, Integer::sum);
     LOG.infof("AgentKeeper typed %s turn %s into %s", turn.kind(), turn.id(), commandId);
   }
 
@@ -596,8 +668,9 @@ final class AgentKeeper {
     if (!type(row.recoveryPrompt(), "the recovery prompt")) {
       return;
     }
-    inFlight = new InFlight(commandId, null, true, runningGeneration);
     typedAt = clock.getAsLong();
+    inFlight = new InFlight(commandId, null, true, runningGeneration, typedAt);
+    tries.merge(inFlight.key(), 1, Integer::sum);
     LOG.infof(
         "AgentKeeper typed the generation %d recovery prompt into %s (from the agent's row)",
         runningGeneration, commandId);
@@ -685,7 +758,14 @@ final class AgentKeeper {
     if (stopping) {
       return; // the next container reports; a late report here would overwrite it
     }
-    String said = detail != null ? detail : pendingDetail.get();
+    String said = detail;
+    if (said == null && owedDetail != null) {
+      said = owedDetail;
+      owedDetail = null;
+    }
+    if (said == null) {
+      said = pendingDetail.get();
+    }
     if (said != null && said.length() > DETAIL_LIMIT) {
       said = said.substring(0, DETAIL_LIMIT);
     }

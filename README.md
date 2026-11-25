@@ -83,6 +83,9 @@ effort, and an appended system prompt of the overseer brief followed by the laun
   first then by `createdAt`. A typed turn is acknowledged with `delivered` only once the session
   took it (its `UserPromptSubmit` hook, BUSY, for that command) at the running generation; nothing
   else is typed meanwhile, and a session that ends first leaves the turn pending for the next one.
+  Not taken within 120 s while the session idles, it is typed again, at most 3 times in all; then it
+  is left pending (unacknowledged), the next report's `detail` reads `turn <id> not taken after 3
+  tries`, and the later turns go on.
 - Reports: STARTING at launch, IDLE/BUSY from the harness hooks (loopback webhook on 127.0.0.1:13337),
   EXITED or FAILED on exit, always with the running generation and a session id the ledger does not
   place at another generation.
@@ -114,6 +117,8 @@ after 60 s of silence, and followed by a full catch-up (backstop + `launch`) aft
 | `INFO AgentKeeper: <command> took the generation <n> recovery prompt` | the session submitted it |
 | `INFO AgentKeeper acknowledged <KIND> turn <id>` | `delivered` landed, after the session took the turn |
 | `INFO AgentKeeper: <what> typed into <command> was not taken; it stays pending` | the session ended first |
+| `WARN AgentKeeper: <what> typed into <command> was not taken within <n> s; typing it again` | no BUSY for it while idle; retyped |
+| `WARN AgentKeeper: <what> typed into <command> was not taken after 3 tries; left pending` | given up for this session |
 | `INFO AgentKeeper: not resuming <id> at generation <n>: it belongs to <generation m\|no generation this daemon recorded>` | `launch.sessionId` is not this generation's |
 | `INFO SessionLedger recorded <id> at generation <n>` | a session placed at its generation |
 | `INFO AgentKeeper stopping: no turn is acknowledged from now on` | the container is stopping |

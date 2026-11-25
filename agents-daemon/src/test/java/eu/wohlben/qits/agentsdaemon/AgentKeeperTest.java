@@ -285,6 +285,70 @@ class AgentKeeperTest {
     assertEquals(List.of(hello), doors.delivered);
   }
 
+  @Test
+  void aTurnNotTakenWithinTheBoundIsTypedAgainOnceAtTheNextIdleAndAcknowledgedOnce() {
+    doors.launch = launch(1, null);
+    UUID hello = doors.turn(1, "COMMENTED", "Hello.", "2026-01-01T00:00:01Z");
+    keeper.refresh();
+    keeper.onActivity("cmd-1", "IDLE", "session-1");
+    assertEquals(List.of("cmd-1:Hello."), harness.typed);
+
+    scheduler.advance(AgentKeeper.Timing.DEFAULT.takeTimeoutMs() - 1);
+    keeper.pollTurns();
+    keeper.onActivity("cmd-1", "IDLE", "session-1");
+    assertEquals(1, harness.typed.size(), "within the bound nothing is retyped");
+
+    scheduler.advance(1);
+    keeper.onActivity("cmd-1", "IDLE", "session-1");
+    keeper.pollTurns();
+    assertEquals(List.of("cmd-1:Hello.", "cmd-1:Hello."), harness.typed, "typed again, once");
+
+    keeper.onActivity("cmd-1", "BUSY", "session-1");
+    keeper.onActivity("cmd-1", "IDLE", "session-1");
+    keeper.pollTurns();
+    assertEquals(List.of(hello), doors.delivered, "taken on the retry: acknowledged once");
+    assertEquals(2, harness.typed.size());
+  }
+
+  @Test
+  void aTurnNeverTakenIsLeftPendingAfterThreeTriesAndTheSessionGoesOn() {
+    doors.launch = launch(1, null);
+    UUID hello = doors.turn(1, "COMMENTED", "Hello.", "2026-01-01T00:00:01Z");
+    keeper.refresh();
+    keeper.onActivity("cmd-1", "IDLE", "session-1");
+    for (int i = 0; i < 4; i++) {
+      scheduler.advance(AgentKeeper.Timing.DEFAULT.takeTimeoutMs());
+      keeper.pollTurns();
+    }
+
+    assertEquals(AgentKeeper.TAKE_TRIES, harness.typed.size());
+    assertTrue(doors.delivered.isEmpty());
+    assertTrue(doors.pending().stream().anyMatch(t -> t.id().equals(hello)), "left pending");
+    assertTrue(
+        doors.reports.stream()
+            .anyMatch(r -> ("turn " + hello + " not taken after 3 tries").equals(r.detail())
+                && !"FAILED".equals(r.state())),
+        "named on a report: " + doors.reports);
+    assertEquals("cmd-1", keeper.commandId(), "the session is kept");
+
+    UUID next = doors.turn(1, "COMMENTED", "Next.", "2026-01-01T00:00:02Z");
+    keeper.pollTurns();
+    keeper.onActivity("cmd-1", "BUSY", "session-1");
+    assertEquals("cmd-1:Next.", harness.typed.getLast(), "the turns after it go on");
+    assertEquals(List.of(next), doors.delivered);
+  }
+
+  @Test
+  void aRowRecoveryPromptNotTakenIsTypedAgain() {
+    doors.launch = launch(3, null);
+    keeper.refresh();
+    keeper.onActivity("cmd-1", "IDLE", "session-3");
+    scheduler.advance(AgentKeeper.Timing.DEFAULT.takeTimeoutMs());
+    keeper.pollTurns();
+
+    assertEquals(List.of("cmd-1:Recover.", "cmd-1:Recover."), harness.typed);
+  }
+
   private void assertNeverPaired(int generation, String session) {
     for (AgentsDoors.Report report : doors.reports) {
       assertTrue(
