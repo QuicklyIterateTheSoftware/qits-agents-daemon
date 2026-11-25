@@ -8,7 +8,7 @@
 # <NAME>=<image>:<tag>` defaults as docker pins (`arg:WORKSPACE_BASE`) and bumps the tag in place.
 # Keep the value LITERAL — the same pin qits-workspace-daemon runs on.
 ARG QITS_DOMAIN=wohlben.eu
-ARG WORKSPACE_BASE=registry.qits.${QITS_DOMAIN}/qits/workspace-base:2026.1124.35143
+ARG WORKSPACE_BASE=registry.qits.${QITS_DOMAIN}/qits/workspace-base:2026.1125.130
 
 # --- stage `build`: native-compile ----------------------------------------------------------------
 # The builder JDK MUST be 25 (this project targets release 25), pulled through qits-mirror's quay
