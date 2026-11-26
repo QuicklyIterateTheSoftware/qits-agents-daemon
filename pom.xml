@@ -36,7 +36,7 @@
         <!-- The shared harness library, released from qits-coding-agents. 2026.1123.182827 is the
              release that added AgentSurface.PROJECT_AGENT (`project.agent`), the surface this
              daemon's one kept session runs as. Exact pin; qits-maintenance bumps it. -->
-        <qits-coding-agents.version>2026.1126.854</qits-coding-agents.version>
+        <qits-coding-agents.version>2026.1126.142114</qits-coding-agents.version>
 
         <!-- The consumer pact against qits-agents-service (test scope): pact-jvm, the platform's
              shared golden-master reader, and what qits-agents-service answers in each provider
