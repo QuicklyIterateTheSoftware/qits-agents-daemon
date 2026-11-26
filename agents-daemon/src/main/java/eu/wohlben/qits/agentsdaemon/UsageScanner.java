@@ -1,5 +1,6 @@
 package eu.wohlben.qits.agentsdaemon;
 
+import io.vertx.core.json.JsonObject;
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -14,14 +15,17 @@ import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -43,15 +47,26 @@ import org.jboss.logging.Logger;
  * <ol>
  *   <li>its line's own {@code cwd} under {@code /workspace/worktrees/<qualified id>/}, the worktrees
  *       {@link OverseerBrief} prescribes;
- *   <li>in a subagent's file, the item its task prompt (the file's first user message) names: the
- *       first {@code /workspace/worktrees/<qualified id>/} path in it, else the first bare {@code
- *       <project>-<n>}. A subagent's lines carry its parent session's {@code cwd}, not the worktree
- *       it works in, so rule 1 alone attributes nothing a subagent does;
+ *   <li>in a subagent's file, the first {@code /workspace/worktrees/<qualified id>/} path its task
+ *       prompt (the file's first user message) names. A subagent's lines carry its parent session's
+ *       {@code cwd}, not the worktree it works in, so rule 1 alone attributes nothing a subagent
+ *       does;
+ *   <li>in a nested subagent's file, its parent's item: the {@code parentAgentId} of the {@code
+ *       agent-<id>.meta.json} Claude Code writes beside it, resolved by these same rules. A research
+ *       subagent of a refinement names the items it reads about, not the one it serves;
+ *   <li>the first bare {@code <project>-<n>} its task prompt names;
  *   <li>else none ({@code workQualifiedId} null): the agent's own overhead.
  * </ol>
  *
+ * <p>The item is decided per file, once its prompt is read, and holds for every message of it: a
+ * subagent resumed for hours keeps appending to its one {@code agent-<id>.jsonl}. Every prompt and
+ * meta file of a session is read before its messages, so a parent's item is known first; the
+ * subagent files are read by their meta file's {@code spawnDepth}, then by name, so a message id a
+ * fork copies from its parent counts once, as the parent's.
+ *
  * <p>Offsets live in memory: a new container rescans from 0, and the door's dedupe on {@code
- * (sessionId, messageId)} absorbs the repeats. A session's offsets move only once all its batches
+ * (sessionId, messageId)} absorbs the repeats. The door re-attributes a resent message that now
+ * names an item (qits-2722), so a rescan also corrects what an earlier daemon attributed. A session's offsets move only once all its batches
  * were accepted, so a failed call is retried whole on the next tick. A failure is logged at WARN once
  * per streak and never thrown.
  */
@@ -86,12 +101,18 @@ final class UsageScanner {
   }
 
   /**
-   * What a subagent file's task prompt names. Derived from the file's content alone, so it is kept
-   * even when the send of its messages fails.
+   * What a subagent file's task prompt and meta file name. Derived from the files' content alone,
+   * so it is kept even when the send of its messages fails.
    */
   private static final class Sidechain {
     boolean promptRead;
-    String workQualifiedId;
+    /** The first worktree path's item in the prompt. */
+    String worktree;
+    /** The first bare qualified id in the prompt. */
+    String bare;
+    boolean metaRead;
+    String parentAgentId;
+    int spawnDepth = 1;
   }
 
   /**
@@ -135,21 +156,42 @@ final class UsageScanner {
     }
     Map<Path, Long> reached = new HashMap<>();
     Map<String, AgentsDoors.UsageMessage> fresh = new LinkedHashMap<>();
-    for (Path file : files(state.main, sessionId)) {
-      long from = state.offsets.getOrDefault(file, 0L);
-      if (size(file) < from) {
-        from = 0; // replaced: read it again
+    List<Path> subagents = subagents(state.main, sessionId);
+    Map<Path, Long> from = new HashMap<>();
+    for (Path file : subagents) {
+      long at = state.offsets.getOrDefault(file, 0L);
+      if (size(file) < at) {
+        at = 0; // replaced: read it again
       }
-      Sidechain sidechain = null;
-      if (!file.equals(state.main)) {
-        if (from == 0) {
-          state.sidechains.remove(file);
-        }
-        sidechain = state.sidechains.computeIfAbsent(file, f -> new Sidechain());
+      if (at == 0) {
+        state.sidechains.remove(file);
       }
-      Sidechain within = sidechain;
-      long to = read(file, from, line -> collect(line, within, state, fresh));
-      if (to != from) {
+      from.put(file, at);
+      Sidechain sidechain = state.sidechains.computeIfAbsent(file, f -> new Sidechain());
+      if (!sidechain.promptRead) {
+        readPrompt(file, sidechain);
+      }
+      if (!sidechain.metaRead) {
+        readMeta(file, sidechain);
+      }
+    }
+    Map<Path, String> items = new HashMap<>();
+    for (Path file : subagents) {
+      items.put(file, item(file, state, 0));
+    }
+    List<Path> files = new ArrayList<>();
+    files.add(state.main);
+    subagents.stream()
+        .sorted(
+            Comparator.comparingInt((Path f) -> state.sidechains.get(f).spawnDepth)
+                .thenComparing(f -> f.getFileName().toString()))
+        .forEach(files::add);
+    for (Path file : files) {
+      long start = from.getOrDefault(file, state.offsets.getOrDefault(file, 0L));
+      boolean sidechain = !file.equals(state.main);
+      String item = sidechain ? items.get(file) : null;
+      long to = read(file, start, line -> collect(line, sidechain, item, state, fresh));
+      if (to != start) {
         reached.put(file, to);
       }
     }
@@ -172,19 +214,12 @@ final class UsageScanner {
     return true;
   }
 
-  private void collect(
+  private static void collect(
       String line,
-      Sidechain sidechain,
+      boolean sidechain,
+      String item,
       SessionState state,
       Map<String, AgentsDoors.UsageMessage> fresh) {
-    if (sidechain != null && !sidechain.promptRead) {
-      TranscriptUsage.userText(line)
-          .ifPresent(
-              prompt -> {
-                sidechain.promptRead = true;
-                sidechain.workQualifiedId = promptWorkQualifiedId(prompt);
-              });
-    }
     TranscriptUsage.of(line)
         .filter(u -> !state.sent.contains(u.messageId()) && !fresh.containsKey(u.messageId()))
         .ifPresent(
@@ -193,7 +228,7 @@ final class UsageScanner {
                     u.messageId(),
                     new AgentsDoors.UsageMessage(
                         u.messageId(),
-                        attribute(u.cwd(), sidechain),
+                        attribute(u.cwd(), sidechain, item),
                         u.model(),
                         u.inputTokens(),
                         u.outputTokens(),
@@ -202,22 +237,91 @@ final class UsageScanner {
                         u.at() == null ? Instant.now() : u.at())));
   }
 
-  private static String attribute(String cwd, Sidechain sidechain) {
+  private static String attribute(String cwd, boolean sidechain, String item) {
     String byCwd = workQualifiedId(cwd);
-    if (byCwd != null || sidechain == null) {
+    if (byCwd != null || !sidechain) {
       return byCwd;
     }
-    return sidechain.workQualifiedId;
+    return item;
   }
+
+  /** A subagent file's item: its prompt's worktree, else its parent's item, else its prompt's bare id. */
+  private static String item(Path file, SessionState state, int depth) {
+    Sidechain sidechain = state.sidechains.get(file);
+    if (sidechain == null) {
+      return null;
+    }
+    if (sidechain.worktree != null) {
+      return sidechain.worktree;
+    }
+    if (sidechain.parentAgentId != null && depth < MAX_NESTING) {
+      Path parent = file.resolveSibling("agent-" + sidechain.parentAgentId + ".jsonl");
+      if (!parent.equals(file)) {
+        String inherited = item(parent, state, depth + 1);
+        if (inherited != null) {
+          return inherited;
+        }
+      }
+    }
+    return sidechain.bare;
+  }
+
+  /** How many parents up an item is looked for; guards a meta file naming a cycle. */
+  static final int MAX_NESTING = 8;
 
   /** The item a task prompt names: its first worktree path, else its first bare qualified id. */
   String promptWorkQualifiedId(String prompt) {
+    String worktree = promptWorktree(prompt);
+    return worktree != null ? worktree : promptBare(prompt);
+  }
+
+  private static String promptWorktree(String prompt) {
     Matcher worktree = WORKTREE_IN_TEXT.matcher(prompt);
-    if (worktree.find()) {
-      return worktree.group(1);
-    }
+    return worktree.find() ? worktree.group(1) : null;
+  }
+
+  private String promptBare(String prompt) {
     Matcher bare = qualifiedId.matcher(prompt);
     return bare.find() ? bare.group(1) : null;
+  }
+
+  /** Reads {@code file}'s first user message, complete lines only, and stops there. */
+  private void readPrompt(Path file, Sidechain sidechain) {
+    readUntil(
+        file,
+        0,
+        line -> {
+          Optional<String> prompt = TranscriptUsage.userText(line);
+          if (prompt.isEmpty()) {
+            return true;
+          }
+          sidechain.promptRead = true;
+          sidechain.worktree = promptWorktree(prompt.get());
+          sidechain.bare = promptBare(prompt.get());
+          return false;
+        });
+  }
+
+  /**
+   * Reads {@code agent-<id>.meta.json} beside {@code file}: its {@code parentAgentId} and {@code
+   * spawnDepth}. Absent or unparseable, the file has no parent and depth 1; it is looked for again
+   * on the next tick.
+   */
+  private static void readMeta(Path file, Sidechain sidechain) {
+    String name = file.getFileName().toString();
+    Path meta = file.resolveSibling(name.substring(0, name.length() - ".jsonl".length()) + ".meta.json");
+    if (!Files.isRegularFile(meta)) {
+      return;
+    }
+    try {
+      JsonObject json = new JsonObject(Files.readString(meta, StandardCharsets.UTF_8));
+      sidechain.metaRead = true;
+      sidechain.parentAgentId =
+          json.getValue("parentAgentId") instanceof String id && !id.isBlank() ? id : null;
+      sidechain.spawnDepth = json.getValue("spawnDepth") instanceof Number n ? n.intValue() : 1;
+    } catch (IOException | RuntimeException e) {
+      LOG.debugf("UsageScanner skipped a meta file that does not read: %s", e.getMessage());
+    }
   }
 
   private static long size(Path file) {
@@ -244,10 +348,9 @@ final class UsageScanner {
     }
   }
 
-  /** The main file and, sorted by name, its subagents' {@code agent-*.jsonl}. */
-  private static List<Path> files(Path main, String sessionId) {
+  /** The main file's subagents' {@code agent-*.jsonl}, sorted by name. */
+  private static List<Path> subagents(Path main, String sessionId) {
     List<Path> files = new ArrayList<>();
-    files.add(main);
     Path subagents = main.resolveSibling(sessionId).resolve("subagents");
     if (Files.isDirectory(subagents)) {
       try (Stream<Path> list = Files.list(subagents)) {
@@ -283,6 +386,17 @@ final class UsageScanner {
    * from 0.
    */
   private static long read(Path file, long from, Consumer<String> lines) {
+    return readUntil(
+        file,
+        from,
+        line -> {
+          lines.accept(line);
+          return true;
+        });
+  }
+
+  /** As {@link #read(Path, long, Consumer)}, stopping after the line {@code lines} answers false for. */
+  private static long readUntil(Path file, long from, Predicate<String> lines) {
     try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ)) {
       long size = channel.size();
       if (size < from) {
@@ -300,9 +414,12 @@ final class UsageScanner {
       while (position < size && (b = in.read()) != -1) {
         position++;
         if (b == '\n') {
-          lines.accept(line.toString(StandardCharsets.UTF_8));
+          boolean more = lines.test(line.toString(StandardCharsets.UTF_8));
           line.reset();
           reached = position;
+          if (!more) {
+            break;
+          }
         } else {
           line.write(b);
         }

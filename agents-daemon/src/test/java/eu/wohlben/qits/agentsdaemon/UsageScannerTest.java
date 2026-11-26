@@ -128,6 +128,99 @@ class UsageScannerTest {
   }
 
   @Test
+  void aNestedSubagentTakesItsParentsItemOverABareIdItsPromptNames() throws IOException {
+    // qits-2722: a research subagent of the qits-2542 refinement names qits-2511, which it only
+    // reads about. Its parent sorts after it by name.
+    main();
+    append(
+        sidechain("agent-b9parent"),
+        user("You are refining qits-2542. Worktree: /workspace/worktrees/qits-2542/qits-qits/"),
+        assistant("msg_p", "/workspace/qits-qits", 1, 1));
+    meta("agent-b9parent", null, 1);
+    append(
+        sidechain("agent-a0child"),
+        user("Read-only research: how qits-2511 records pacts."),
+        assistant("msg_c", "/workspace/qits-qits", 1, 1));
+    meta("agent-a0child", "b9parent", 2);
+    // Its own worktree path still wins over the parent's.
+    append(
+        sidechain("agent-a1child"),
+        user("Look at /workspace/worktrees/qits-2701/qits-qits/ for qits-2542."),
+        assistant("msg_w", "/workspace/qits-qits", 1, 1));
+    meta("agent-a1child", "b9parent", 2);
+    // A parent with no item of its own leaves the bare id.
+    append(
+        sidechain("agent-c2parent"),
+        user("Find the README."),
+        assistant("msg_n", "/workspace/qits-qits", 1, 1));
+    append(
+        sidechain("agent-c3child"),
+        user("Read how qits-2511 records pacts."),
+        assistant("msg_b", "/workspace/qits-qits", 1, 1));
+    meta("agent-c3child", "c2parent", 2);
+
+    scanner().tick();
+    Map<String, AgentsDoors.UsageMessage> byId = byId(doors.reports.getFirst());
+    assertEquals("qits-2542", byId.get("msg_p").workQualifiedId());
+    assertEquals("qits-2542", byId.get("msg_c").workQualifiedId(), "the parent's item");
+    assertEquals("qits-2701", byId.get("msg_w").workQualifiedId(), "its own worktree first");
+    assertNull(byId.get("msg_n").workQualifiedId());
+    assertEquals("qits-2511", byId.get("msg_b").workQualifiedId(), "else its bare id");
+  }
+
+  @Test
+  void aMessageAForkSharesWithItsParentCountsOnceAsTheParents() throws IOException {
+    main();
+    append(
+        sidechain("agent-b9parent"),
+        user("Implement epic qits-2542 in /workspace/worktrees/qits-2542/qits-qits/."),
+        assistant("msg_shared", "/workspace/qits-qits", 1, 1),
+        assistant("msg_p", "/workspace/qits-qits", 1, 1));
+    meta("agent-b9parent", null, 1);
+    // The fork sorts first by name and copies the parent's last message.
+    append(
+        sidechain("agent-a0fork"),
+        user("Continue in /workspace/worktrees/qits-2701/qits-qits/."),
+        assistant("msg_shared", "/workspace/qits-qits", 1, 1),
+        assistant("msg_f", "/workspace/qits-qits", 1, 1));
+    meta("agent-a0fork", "b9parent", 2);
+
+    scanner().tick();
+    AgentsDoors.UsageReport report = doors.reports.getFirst();
+    assertEquals(3, report.messages().size(), "the shared message once");
+    Map<String, AgentsDoors.UsageMessage> byId = byId(report);
+    assertEquals("qits-2542", byId.get("msg_shared").workQualifiedId());
+    assertEquals("qits-2701", byId.get("msg_f").workQualifiedId());
+  }
+
+  @Test
+  void aResumedSubagentKeepsItsPromptsItemAlsoAfterARescanFromZero() throws IOException {
+    main();
+    Path file = sidechain("agent-a1");
+    append(
+        file,
+        user("You are implementing qits-2570 in /workspace/worktrees/qits-2570/qits-qits/."),
+        assistant("msg_1", "/workspace/qits-qits", 1, 1));
+    UsageScanner first = scanner();
+    first.tick();
+    // Resumed hours later: the coordinator's message about another item is appended to the same file.
+    append(
+        file,
+        user("The coordinator sent a message: now look at /workspace/worktrees/qits-2581/qits-qits/."),
+        assistant("msg_2", "/workspace/qits-qits", 1, 1));
+    first.tick();
+    assertEquals("qits-2570", byId(doors.reports.get(1)).get("msg_2").workQualifiedId());
+
+    // A new container: a fresh scanner reads the file from 0 and resends both.
+    doors.reports.clear();
+    scanner().tick();
+    Map<String, AgentsDoors.UsageMessage> byId = byId(doors.reports.getFirst());
+    assertEquals(2, byId.size());
+    assertEquals("qits-2570", byId.get("msg_1").workQualifiedId());
+    assertEquals("qits-2570", byId.get("msg_2").workQualifiedId());
+  }
+
+  @Test
   void aFailedSendKeepsTheSubagentsItem() throws IOException {
     main();
     Path file = sidechain("agent-a1");
@@ -226,6 +319,16 @@ class UsageScannerTest {
   private Path sidechain(String name) throws IOException {
     Path subagents = Files.createDirectories(dir.resolve(SESSION).resolve("subagents"));
     return subagents.resolve(name + ".jsonl");
+  }
+
+  /** Claude Code's {@code agent-<id>.meta.json} beside a subagent's transcript. */
+  private void meta(String name, String parentAgentId, int spawnDepth) throws IOException {
+    JsonObject meta = new JsonObject().put("agentType", "general-purpose").put("spawnDepth", spawnDepth);
+    if (parentAgentId != null) {
+      meta.put("parentAgentId", parentAgentId);
+    }
+    Files.writeString(
+        dir.resolve(SESSION).resolve("subagents").resolve(name + ".meta.json"), meta.encode());
   }
 
   private static void append(Path file, String... lines) throws IOException {
