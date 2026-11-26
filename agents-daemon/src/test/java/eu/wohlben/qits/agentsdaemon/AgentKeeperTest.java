@@ -27,6 +27,8 @@ import org.junit.jupiter.api.io.TempDir;
 class AgentKeeperTest {
 
   static final UUID PROJECT_ID = UUID.fromString("00000000-0000-4000-8000-000000000002");
+  static final String NOTICE = ResumeNotice.text();
+  static final long FAILED = AgentKeeper.Timing.DEFAULT.failedTurnBackoffMs();
 
   final FakeDoors doors = new FakeDoors();
   final FakeHarness harness = new FakeHarness();
@@ -139,7 +141,7 @@ class AgentKeeperTest {
   }
 
   @Test
-  void aContainerStartWithASessionOfTheSameGenerationResumesItAndRetypesNothing() {
+  void aContainerStartWithASessionOfTheSameGenerationResumesItWithTheNoticeNotTheRecovery() {
     ledger.record("session-3", 3);
     harness.transcripts.add("session-3");
     doors.launch = launch(3, "session-3");
@@ -151,7 +153,10 @@ class AgentKeeperTest {
     keeper.pollTurns();
 
     assertEquals("session-3", harness.plans.getFirst().request().resumeSessionId());
-    assertTrue(harness.typed.isEmpty(), "a resumed session already has its recovery");
+    assertEquals(
+        List.of("cmd-1:" + ResumeNotice.text()),
+        harness.typed,
+        "a resumed session already has its recovery; its subagents are gone (the spec roll)");
     assertEquals(0, doors.agentReads);
     assertEquals(new AgentsDoors.Report(3, "IDLE", "session-3", null), doors.reports.getLast());
   }
@@ -183,7 +188,7 @@ class AgentKeeperTest {
     UUID recovery = doors.turn(3, "RECOVERY", "You were restarted.", "2026-01-01T00:00:03Z");
     keeper.refresh();
     keeper.onActivity("cmd-2", "IDLE", "session-3");
-    assertEquals(List.of("cmd-2:You were restarted."), harness.typed);
+    assertEquals(List.of("cmd-1:" + NOTICE, "cmd-2:You were restarted."), harness.typed);
     keeper.stop(); // SIGTERM: the container is replaced
     keeper.onActivity("cmd-2", "BUSY", "session-3");
     keeper.pollTurns();
@@ -279,9 +284,11 @@ class AgentKeeperTest {
     scheduler.advance(5_000);
     keeper.onActivity("cmd-2", "IDLE", "session-1");
     keeper.onActivity("cmd-2", "BUSY", "session-1");
+    keeper.onActivity("cmd-2", "IDLE", "session-1");
+    keeper.onActivity("cmd-2", "BUSY", "session-1");
 
     assertEquals("session-1", harness.plans.get(1).request().resumeSessionId());
-    assertEquals(List.of("cmd-1:Hello.", "cmd-2:Hello."), harness.typed);
+    assertEquals(List.of("cmd-1:Hello.", "cmd-2:" + NOTICE, "cmd-2:Hello."), harness.typed);
     assertEquals(List.of(hello), doors.delivered);
   }
 
@@ -476,6 +483,180 @@ class AgentKeeperTest {
     assertEquals("cmd-1", keeper.commandId());
   }
 
+  // --- failed turns (qits-2715) ----------------------------------------------------------------
+
+  /**
+   * The developer of 2026-11-26: every turn ended in an API error and the session read BUSY for
+   * hours. Now the turn is typed again on a doubling, capped backoff, the reports say why, and only
+   * a Stop — never the idle prompt that follows a failed turn as well — ends the streak.
+   */
+  @Test
+  void aTurnAnApiErrorEndedIsTypedAgainOnADoublingCappedBackoffUntilATurnEndsWell() {
+    doors.launch = launch(1, null);
+    UUID hello = doors.turn(1, "COMMENTED", "Hello.", "2026-01-01T00:00:01Z");
+    keeper.refresh();
+    keeper.onActivity("cmd-1", "IDLE", "session-1");
+    keeper.onActivity("cmd-1", "BUSY", "session-1");
+    assertEquals(List.of(hello), doors.delivered);
+    UUID next = doors.turn(1, "COMMENTED", "Next.", "2026-01-01T00:00:02Z");
+
+    keeper.onActivity("cmd-1", "FAILED_TURN", "session-1", "server_error: Unable to connect to API");
+    assertEquals(
+        new AgentsDoors.Report(1, "IDLE", "session-1", "turn failed (1 in a row): server_error: Unable to connect to API"),
+        doors.reports.getLast());
+
+    long[] expected = {FAILED, 2 * FAILED, 4 * FAILED, 8 * FAILED, 16 * FAILED, 1_800_000, 1_800_000};
+    for (int n = 1; n <= expected.length; n++) {
+      scheduler.advance(expected[n - 1] - 1);
+      keeper.pollTurns();
+      keeper.onActivity("cmd-1", "IDLE_PROMPT", "session-1"); // ~60 s after the failure
+      keeper.pollTurns();
+      assertEquals(n, harness.typed.size(), "nothing is typed during backoff " + n);
+      scheduler.advance(1);
+      assertEquals(n + 1, harness.typed.size(), "typed again once backoff " + n + " ran out");
+      assertEquals("cmd-1:Hello.", harness.typed.getLast(), "the failed turn first, before Next.");
+      keeper.onActivity("cmd-1", "BUSY", "session-1");
+      keeper.onActivity("cmd-1", "FAILED_TURN", "session-1", "overloaded");
+      assertEquals("turn failed (" + (n + 1) + " in a row): overloaded", doors.reports.getLast().detail());
+    }
+    assertEquals(List.of(hello), doors.delivered, "taken again, never acknowledged again");
+    assertEquals(1, doors.deliveredCalls);
+    assertEquals(1, keeper.generation());
+
+    // The idle prompt did not end the streak; a Stop after the turn is taken again does.
+    scheduler.advance(1_800_000);
+    keeper.onActivity("cmd-1", "BUSY", "session-1");
+    assertEquals("turn failed (8 in a row): overloaded", doors.reports.getLast().detail(), "carried");
+    keeper.onActivity("cmd-1", "IDLE", "session-1");
+    assertEquals(new AgentsDoors.Report(1, "IDLE", "session-1", null), doors.reports.getLast(), "no detail");
+    assertEquals("cmd-1:Next.", harness.typed.getLast(), "the queue goes on at once");
+    keeper.onActivity("cmd-1", "BUSY", "session-1");
+    assertNull(doors.reports.getLast().detail());
+    assertEquals(List.of(hello, next), doors.delivered);
+
+    // A new streak starts at the first rung, with the turn that failed now.
+    keeper.onActivity("cmd-1", "FAILED_TURN", "session-1", null);
+    assertEquals("turn failed (1 in a row)", doors.reports.getLast().detail());
+    int typed = harness.typed.size();
+    scheduler.advance(FAILED);
+    assertEquals(typed + 1, harness.typed.size());
+    assertEquals("cmd-1:Next.", harness.typed.getLast());
+  }
+
+  @Test
+  void aFailedTurnWhoseAcknowledgementDidNotLandIsAcknowledgedOnceAndNeverQueuedTwice() {
+    doors.launch = launch(1, null);
+    UUID hello = doors.turn(1, "COMMENTED", "Hello.", "2026-01-01T00:00:01Z");
+    doors.failNextDelivered = true;
+    keeper.refresh();
+    keeper.onActivity("cmd-1", "IDLE", "session-1");
+    keeper.onActivity("cmd-1", "BUSY", "session-1");
+    keeper.onActivity("cmd-1", "FAILED_TURN", "session-1", "rate_limit");
+
+    keeper.pollTurns(); // the owed acknowledgement lands; the turn is not queued again
+    scheduler.advance(FAILED);
+    keeper.pollTurns();
+    keeper.onActivity("cmd-1", "BUSY", "session-1");
+    keeper.onActivity("cmd-1", "IDLE", "session-1");
+    keeper.pollTurns();
+
+    assertEquals(List.of("cmd-1:Hello.", "cmd-1:Hello."), harness.typed);
+    assertEquals(List.of(hello), doors.delivered);
+    assertEquals(2, doors.deliveredCalls, "the failed call and the one that landed");
+  }
+
+  @Test
+  void aFailureBackoffOfAnEndedSessionDoesNothingAndARelaunchForgetsTheStreak() {
+    doors.launch = launch(1, null);
+    doors.turn(1, "COMMENTED", "Hello.", "2026-01-01T00:00:01Z");
+    keeper.refresh();
+    keeper.onActivity("cmd-1", "IDLE", "session-1");
+    keeper.onActivity("cmd-1", "BUSY", "session-1");
+    keeper.onActivity("cmd-1", "FAILED_TURN", "session-1", "unknown");
+    harness.transcripts.add("session-1");
+    harness.exit("cmd-1", 137);
+    keeper.watch();
+    scheduler.advance(5_000); // relaunched, resuming session-1
+
+    keeper.onActivity("cmd-2", "IDLE", "session-1");
+    keeper.onActivity("cmd-2", "BUSY", "session-1");
+    keeper.onActivity("cmd-2", "IDLE", "session-1");
+    scheduler.advance(FAILED);
+
+    assertEquals(List.of("cmd-1:Hello.", "cmd-2:" + NOTICE), harness.typed, "the old streak's retype is void");
+    assertNull(doors.reports.getLast().detail());
+  }
+
+  // --- the resume notice (qits-2715) -----------------------------------------------------------
+
+  @Test
+  void aSessionResumedAfterACrashIsToldItsSubagentsAreGoneBeforeItsTurns() {
+    doors.launch = launch(4, null);
+    keeper.refresh();
+    keeper.onActivity("cmd-1", "IDLE", "session-4");
+    keeper.onActivity("cmd-1", "BUSY", "session-4");
+    assertEquals(List.of("cmd-1:Recover."), harness.typed, "fresh: the recovery prompt");
+    UUID take = doors.turn(4, "ASSIGNED", "Take qits-1.", "2026-01-01T00:00:01Z");
+
+    harness.transcripts.add("session-4");
+    harness.exit("cmd-1", 137); // OOM-killed mid-turn
+    keeper.watch();
+    scheduler.advance(5_000);
+    assertEquals("session-4", harness.plans.get(1).request().resumeSessionId());
+    keeper.onActivity("cmd-2", "IDLE", "session-4");
+    keeper.pollTurns();
+    assertEquals("cmd-2:" + NOTICE, harness.typed.getLast(), "the notice before the queued turn");
+    keeper.onActivity("cmd-2", "BUSY", "session-4");
+    assertTrue(doors.delivered.isEmpty(), "the notice is no turn of the inbox");
+    keeper.onActivity("cmd-2", "IDLE", "session-4");
+    keeper.onActivity("cmd-2", "BUSY", "session-4");
+    keeper.onActivity("cmd-2", "IDLE", "session-4");
+    assertEquals(List.of("cmd-1:Recover.", "cmd-2:" + NOTICE, "cmd-2:Take qits-1."), harness.typed);
+    assertEquals(List.of(take), doors.delivered);
+    assertEquals(1, doors.agentReads, "never the recovery prompt into a resumed session");
+
+    // A new generation is fresh: the recovery prompt, never the notice.
+    doors.launch = launch(5, "session-4");
+    keeper.refresh();
+    assertNull(harness.plans.get(2).request().resumeSessionId());
+    keeper.onActivity("cmd-3", "IDLE", "session-5");
+    keeper.onActivity("cmd-3", "BUSY", "session-5");
+    keeper.onActivity("cmd-3", "IDLE", "session-5");
+    assertEquals(List.of("cmd-3:Recover."), harness.typed.stream().filter(t -> t.startsWith("cmd-3:")).toList());
+  }
+
+  @Test
+  void aFreshFirstGenerationSessionIsToldNeither() {
+    doors.launch = launch(1, null);
+    keeper.refresh();
+    keeper.onActivity("cmd-1", "IDLE", "session-1");
+    keeper.pollTurns();
+
+    assertTrue(harness.typed.isEmpty(), harness.typed.toString());
+  }
+
+  @Test
+  void aResumeNoticeNeverTakenIsLeftAfterThreeTriesAndTheTurnsGoOn() {
+    ledger.record("session-2", 2);
+    harness.transcripts.add("session-2");
+    doors.launch = launch(2, "session-2");
+    keeper.refresh();
+    keeper.onActivity("cmd-1", "IDLE", "session-2");
+    for (int i = 0; i < 4; i++) {
+      scheduler.advance(AgentKeeper.Timing.DEFAULT.takeTimeoutMs());
+      keeper.pollTurns();
+    }
+    assertEquals(AgentKeeper.TAKE_TRIES, harness.typed.size());
+    assertTrue(harness.typed.stream().allMatch(t -> t.equals("cmd-1:" + NOTICE)));
+    assertTrue(
+        doors.reports.stream().anyMatch(r -> "resume notice not taken after 3 tries".equals(r.detail())),
+        doors.reports.toString());
+
+    doors.turn(2, "COMMENTED", "Next.", "2026-01-01T00:00:02Z");
+    keeper.pollTurns();
+    assertEquals("cmd-1:Next.", harness.typed.getLast());
+  }
+
   // --- fakes -----------------------------------------------------------------------------------
 
   static AgentsDoors.Launch launch(int generation, String sessionId) {
@@ -489,6 +670,7 @@ class AgentKeeperTest {
     boolean failTurns;
     String recoveryPrompt = "Recover.";
     int agentReads;
+    int deliveredCalls;
     final List<Turn> turns = new ArrayList<>();
     final Set<UUID> deliveredSet = new HashSet<>();
     final List<UUID> delivered = new ArrayList<>();
@@ -536,6 +718,7 @@ class AgentKeeperTest {
 
     @Override
     public void delivered(UUID turnId) {
+      deliveredCalls++;
       if (failNextDelivered) {
         failNextDelivered = false;
         throw new Unavailable("delivered answered 502");

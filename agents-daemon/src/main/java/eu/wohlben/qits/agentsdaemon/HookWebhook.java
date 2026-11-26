@@ -13,8 +13,17 @@ import org.jboss.logging.Logger;
  * The loopback sink the session's lifecycle hooks POST to — the harness library renders the hook
  * curl to {@code 127.0.0.1:<port>/hooks/claude-code?commandId=…}. Mapped as qits-projects-daemon's
  * {@code HookWebhook} maps it: SessionStart and Stop are IDLE, UserPromptSubmit is BUSY, a
- * Notification is WAITING (unless it is the idle prompt, which is IDLE), SessionEnd is ENDED. A Stop
- * while a permission prompt is open stays WAITING.
+ * Notification is WAITING, SessionEnd is ENDED. A Stop while a permission prompt is open stays
+ * WAITING. Two words only the keeper hears, both IDLE to the harness library:
+ *
+ * <ul>
+ *   <li>{@code StopFailure} — Claude's Stop when an API error ended the turn — is {@value
+ *       #FAILED_TURN}, its {@code error} and {@code error_details} handed over as one line of at
+ *       most {@value #ERROR_LIMIT} characters ({@code server_error: Unable to connect to API}).
+ *   <li>The idle-prompt Notification (Claude's "waiting for your input", some 60 s after a turn
+ *       ended) is {@value #IDLE_PROMPT}: idle, but no proof that a turn succeeded — it follows a
+ *       failed turn as surely as a good one. Only a Stop (or a SessionStart) is IDLE to the keeper.
+ * </ul>
  */
 final class HookWebhook {
 
@@ -22,9 +31,21 @@ final class HookWebhook {
 
   static final String PATH = "/hooks/claude-code";
 
-  /** What a mapped hook is handed to: command id, state, session id (may be null). */
+  /** The keeper's word for a turn an API error ended ({@code StopFailure}). */
+  static final String FAILED_TURN = "FAILED_TURN";
+
+  /** The keeper's word for the idle-prompt Notification: idle, not a turn that succeeded. */
+  static final String IDLE_PROMPT = "IDLE_PROMPT";
+
+  /** The longest error text a failed turn hands over. */
+  static final int ERROR_LIMIT = 200;
+
+  /**
+   * What a mapped hook is handed to: command id, state, session id (may be null), and the error of
+   * a {@value #FAILED_TURN} (null otherwise, and when the hook named none).
+   */
   interface Listener {
-    void activity(String commandId, String state, String sessionId);
+    void activity(String commandId, String state, String sessionId, String error);
   }
 
   private final Vertx vertx;
@@ -81,24 +102,54 @@ final class HookWebhook {
       return;
     }
     boolean idlePrompt = "Notification".equals(hookEvent) && isIdlePrompt(body);
-    String state = idlePrompt ? "IDLE" : map(hookEvent);
+    String state = idlePrompt ? IDLE_PROMPT : map(hookEvent);
     if (state == null) {
       return;
     }
+    // A StopFailure is not held at WAITING as a Stop is: an API error ended the turn, so no
+    // permission prompt of it can still be open, and a WAITING left over from a prompt answered
+    // earlier in the turn (it lasts until the next UserPromptSubmit) would hide the failure.
     if (("Stop".equals(hookEvent) || idlePrompt) && "WAITING".equals(lastState.get(commandId))) {
       state = "WAITING";
     }
-    if ("ENDED".equals(state)) {
+    // The harness library knows IDLE, BUSY, WAITING and ENDED: the keeper's two words are IDLE there.
+    String stored = IDLE_PROMPT.equals(state) || FAILED_TURN.equals(state) ? "IDLE" : state;
+    if ("ENDED".equals(stored)) {
       lastState.remove(commandId);
     } else {
-      lastState.put(commandId, state);
+      lastState.put(commandId, stored);
     }
     try {
-      launchService.accept(commandId, state);
+      launchService.accept(commandId, stored);
     } catch (RuntimeException e) {
       LOG.debugf("onActivity failed for %s: %s", commandId, e.getMessage());
     }
-    listener.activity(commandId, state, body.getString("session_id"));
+    String error = FAILED_TURN.equals(state) ? error(body) : null;
+    listener.activity(commandId, state, body.getString("session_id"), error);
+  }
+
+  /**
+   * A StopFailure's {@code error} and {@code error_details}, as {@code <error>: <details>} on one
+   * line of at most {@value #ERROR_LIMIT} characters; null when it names neither.
+   */
+  static String error(JsonObject body) {
+    String category = text(body.getValue("error"));
+    String details = text(body.getValue("error_details"));
+    String said =
+        category == null ? details : details == null ? category : category + ": " + details;
+    if (said == null) {
+      return null;
+    }
+    return said.length() > ERROR_LIMIT ? said.substring(0, ERROR_LIMIT) : said;
+  }
+
+  /** {@code value} as one trimmed line, or null when it is absent, blank or not a string. */
+  private static String text(Object value) {
+    if (!(value instanceof String raw)) {
+      return null;
+    }
+    String line = raw.replaceAll("\\s+", " ").trim();
+    return line.isEmpty() ? null : line;
   }
 
   static boolean isIdlePrompt(JsonObject body) {
@@ -116,6 +167,7 @@ final class HookWebhook {
     }
     return switch (hookEvent) {
       case "SessionStart", "Stop" -> "IDLE";
+      case "StopFailure" -> FAILED_TURN;
       case "UserPromptSubmit" -> "BUSY";
       case "Notification" -> "WAITING";
       case "SessionEnd" -> "ENDED";

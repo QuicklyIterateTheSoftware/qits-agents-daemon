@@ -38,11 +38,16 @@ import org.jboss.logging.Logger;
  *       SessionLedger} places it at the launch's generation and its transcript is on the credential
  *       volume. A session the ledger does not place there is never resumed: a new container at a
  *       new generation would otherwise resume the previous generation's session, which {@code
- *       launch.sessionId} still names.
+ *       launch.sessionId} still names. A resumed session — after a crash, an OOM kill, or a new
+ *       container at the same generation (a spec roll) — runs in a new harness process, so the
+ *       subagents of the old one are gone: it begins with the {@link ResumeNotice}, typed once,
+ *       before any turn, and taken as a turn is (its UserPromptSubmit), at most {@value
+ *       #TAKE_TRIES} times.
  *   <li><b>New generation.</b> {@code launch.generation} exceeds the running one: the session is
  *       ended and a <em>fresh</em> one launched (no resume); the pending turns follow it, RECOVERY
  *       first.
- *   <li><b>Recovery.</b> Every fresh session at a generation past the first begins with that
+ *   <li><b>Recovery.</b> Every fresh session at a generation past the first — and never a resumed
+ *       one, which gets the resume notice instead — begins with that
  *       generation's recovery prompt: the pending RECOVERY turn of the generation when there is
  *       one, else the row's {@code recoveryPrompt} — the RECOVERY turn may already have been
  *       acknowledged by a container that died before its session took it. Typed once per session;
@@ -57,9 +62,21 @@ import org.jboss.logging.Logger;
  *       Not taken within {@code takeTimeoutMs} (120 s) while the session idles: typed again, at most
  *       {@value #TAKE_TRIES} times in all; then left pending, named in the next report's detail, and
  *       the session goes on with the turns after it.
+ *   <li><b>Failed turns.</b> A turn an API error ended (the StopFailure hook, {@code FAILED_TURN})
+ *       leaves the session idle, but what it took — a turn, the recovery prompt or the resume
+ *       notice — is lost to it. The keeper keeps its own copy of what the session last took and
+ *       puts it back, before anything else, to be typed again once a backoff ran out: {@code
+ *       failedTurnBackoffMs} (1 min) doubling to {@code maxFailedTurnBackoffMs} (30 min), never
+ *       giving up while the generation stands. Nothing is typed during the backoff. The copy is
+ *       not a turn of the inbox again: it was acknowledged when first taken and is never
+ *       acknowledged twice, and the turns poll skips it as it skips every acknowledged turn. Only a
+ *       Stop (IDLE — the turn ended well) ends the streak; the idle-prompt Notification (IDLE_PROMPT)
+ *       follows a failed turn as well and ends nothing. A launch, a stop or a retirement forgets
+ *       the streak.
  *   <li><b>Report</b>: STARTING at launch, IDLE/BUSY from the harness hooks, EXITED or FAILED on
  *       exit, always with the running generation and a session id the ledger does not place at
- *       another generation.
+ *       another generation. A failed turn is IDLE with detail {@code turn failed (<n> in a row):
+ *       <error>}, carried by every report until a turn ends well.
  *   <li><b>Stopping</b> (the container stops): {@link #stop} before the sessions are terminated;
  *       from then on nothing is typed, acknowledged, reported or launched.
  *   <li><b>Retired</b> ({@code launch} answers 409): the session is stopped and the keeper idles,
@@ -79,7 +96,11 @@ final class AgentKeeper {
   /** The longest detail a report carries. */
   static final int DETAIL_LIMIT = 200;
 
-  /** Cadences and the ladder, in milliseconds. */
+  /**
+   * Cadences and the ladders, in milliseconds: the relaunch ladder ({@code initialBackoffMs} doubling
+   * to {@code maxBackoffMs}) and the failed-turn ladder ({@code failedTurnBackoffMs} doubling to
+   * {@code maxFailedTurnBackoffMs}).
+   */
   record Timing(
       long initialBackoffMs,
       long maxBackoffMs,
@@ -88,10 +109,12 @@ final class AgentKeeper {
       long turnsPollMs,
       long watchMs,
       long startGraceMs,
-      long takeTimeoutMs) {
+      long takeTimeoutMs,
+      long failedTurnBackoffMs,
+      long maxFailedTurnBackoffMs) {
 
     static final Timing DEFAULT =
-        new Timing(5_000, 300_000, 600_000, 30_000, 10_000, 2_000, 30_000, 120_000);
+        new Timing(5_000, 300_000, 600_000, 30_000, 10_000, 2_000, 30_000, 120_000, 60_000, 1_800_000);
   }
 
   /** How often one thing is typed into one session before it is left pending. */
@@ -160,28 +183,56 @@ final class AgentKeeper {
   private InFlight inFlight;
   /** The generation whose recovery prompt the running (fresh) session still owes, else -1. */
   private int recoveryOwed = -1;
+  /** The running (resumed) session still owes the {@link ResumeNotice}. */
+  private boolean resumeNoticeOwed;
+  /** What the running session last took from the keeper, until its turn ends or fails. */
+  private InFlight lastTaken;
+  /** What a failed turn put back: typed before anything else once the failure backoff ran out. */
+  private InFlight retype;
+  /** Turns of the running session an API error ended in a row; 0 since its last good one. */
+  private int failedTurns;
+  /** Nothing is typed before this clock time (the failure backoff); -1 when none runs. */
+  private long failedUntil = -1;
+  /** The failure the reports carry until a turn ends well, else null. */
+  private String failureDetail;
   /** The command that took the running generation's recovery prompt, else null. */
   private String recoveryTakenBy;
   /** Set once, from the shutdown thread: the container is stopping. */
   private volatile boolean stopping;
 
   /**
-   * Typed into {@code commandId} at {@code generation}: a turn of the inbox, or (turn null) the
-   * row's recovery prompt; {@code recovery} when it is that generation's recovery prompt.
+   * {@code text} typed into {@code commandId} at {@code generation}: a turn of the inbox, the
+   * {@link ResumeNotice} ({@code notice}), or (turn null) the row's recovery prompt; {@code recovery}
+   * when it is that generation's recovery prompt; {@code retry} when it is typed again after a turn
+   * of it failed — already taken once, so never acknowledged again.
    */
   private record InFlight(
-      String commandId, AgentsDoors.Turn turn, boolean recovery, int generation, long typedAt) {
+      String commandId,
+      AgentsDoors.Turn turn,
+      String text,
+      boolean recovery,
+      boolean notice,
+      boolean retry,
+      int generation,
+      long typedAt) {
 
     String what() {
-      return turn == null ? "the recovery prompt" : turn.kind() + " turn " + turn.id();
+      return notice ? "the resume notice" : turn == null ? "the recovery prompt" : turn.kind() + " turn " + turn.id();
     }
 
     String key() {
-      return turn == null ? "recovery-" + generation : turn.id().toString();
+      String key = notice ? "resume-notice" : turn == null ? "recovery-" + generation : turn.id().toString();
+      return retry ? "retry-" + key : key;
     }
 
     String notTaken() {
-      return (turn == null ? "recovery prompt" : "turn " + turn.id()) + " not taken after " + TAKE_TRIES + " tries";
+      String which = notice ? "resume notice" : turn == null ? "recovery prompt" : "turn " + turn.id();
+      return which + " not taken after " + TAKE_TRIES + " tries";
+    }
+
+    /** This, to be typed again after a failed turn, at {@code at}. */
+    InFlight again(String into, long at) {
+      return new InFlight(into, turn, text, recovery, notice, true, generation, at);
     }
   }
 
@@ -232,7 +283,12 @@ final class AgentKeeper {
 
   /** A hook reported the session's activity. */
   void activity(String commandId, String state, String sessionId) {
-    scheduler.schedule(() -> onActivity(commandId, state, sessionId), 0);
+    activity(commandId, state, sessionId, null);
+  }
+
+  /** A hook reported the session's activity; {@code error} is a failed turn's (see HookWebhook). */
+  void activity(String commandId, String state, String sessionId, String error) {
+    scheduler.schedule(() -> onActivity(commandId, state, sessionId, error), 0);
   }
 
   /**
@@ -338,6 +394,7 @@ final class AgentKeeper {
     relaunchPending = false;
     queue.clear();
     inFlight = null;
+    clearFailures();
     if (commandId != null) {
       stopSession();
       report(AgentsDoors.Report.EXITED, "retired");
@@ -351,6 +408,7 @@ final class AgentKeeper {
     commandId = null;
     activity = null;
     typedAt = -1;
+    clearFailures();
     if (inFlight != null) {
       LOG.infof("AgentKeeper: %s typed into %s was not taken; it stays pending", inFlight.what(), ending);
       inFlight = null;
@@ -392,7 +450,10 @@ final class AgentKeeper {
     sessionId = resume;
     // A fresh session knows nothing: past the first generation it begins with the recovery prompt.
     recoveryOwed = resume == null && generation > 1 ? generation : -1;
+    // A resumed one remembers everything but its subagents, which died with the old process.
+    resumeNoticeOwed = resume != null;
     recoveryTakenBy = null;
+    clearFailures();
     report(AgentsDoors.Report.STARTING, null);
     String launched;
     try {
@@ -486,6 +547,7 @@ final class AgentKeeper {
     commandId = null;
     activity = null;
     typedAt = -1;
+    clearFailures();
     if (inFlight != null) {
       LOG.infof("AgentKeeper: %s typed into %s was not taken; it stays pending", inFlight.what(), exited);
       inFlight = null;
@@ -547,6 +609,15 @@ final class AgentKeeper {
           .thenComparing(t -> t.createdAt() == null ? "" : t.createdAt());
 
   void onActivity(String forCommand, String state, String reportedSession) {
+    onActivity(forCommand, state, reportedSession, null);
+  }
+
+  /**
+   * One hook's word, as HookWebhook maps it: IDLE (a Stop — the turn ended well — or a
+   * SessionStart), IDLE_PROMPT (idle, but no proof of a good turn: it follows a failed one too),
+   * FAILED_TURN (an API error ended the turn, {@code error} says which), BUSY, WAITING, ENDED.
+   */
+  void onActivity(String forCommand, String state, String reportedSession, String error) {
     if (stopping || forCommand == null || !forCommand.equals(commandId) || state == null) {
       return;
     }
@@ -555,14 +626,24 @@ final class AgentKeeper {
     }
     switch (state) {
       case "IDLE" -> {
+        turnEnded();
         activity = AgentsDoors.Report.IDLE;
         report(AgentsDoors.Report.IDLE, null);
         flushOne();
       }
+      case HookWebhook.IDLE_PROMPT -> {
+        activity = AgentsDoors.Report.IDLE;
+        report(AgentsDoors.Report.IDLE, null);
+        flushOne();
+      }
+      case HookWebhook.FAILED_TURN -> turnFailed(error);
       case "BUSY", "WAITING" -> {
         activity = AgentsDoors.Report.BUSY;
         typedAt = -1;
         if ("BUSY".equals(state)) {
+          if (inFlight == null) {
+            lastTaken = null; // a prompt the keeper did not type: a failure of it is not retyped
+          }
           onTaken(forCommand); // UserPromptSubmit: the session took what was typed
         }
         report(AgentsDoors.Report.BUSY, null);
@@ -574,8 +655,75 @@ final class AgentKeeper {
   }
 
   /**
-   * Types the next thing into the session, if it is idle, up for the running generation and not
-   * still taking the last one: the recovery prompt a fresh session owes, else the first queued turn.
+   * A Stop: the session's turn ended well. Whatever it last took is done with, and a failure streak
+   * ends — the backoff, the count and the reports' failure detail. What a failure put back to be
+   * typed again is still owed: it was not what just succeeded.
+   */
+  private void turnEnded() {
+    lastTaken = null;
+    if (failedTurns > 0) {
+      LOG.infof("AgentKeeper: %s ended a turn well after %d failed ones", commandId, failedTurns);
+    }
+    failedTurns = 0;
+    failedUntil = -1;
+    failureDetail = null;
+  }
+
+  /**
+   * A StopFailure: an API error ended the session's turn. What it last took (a turn, the recovery
+   * prompt or the resume notice; acknowledged already, never again) is put back first, to be typed
+   * again once the failure backoff — {@code failedTurnBackoffMs} doubling to {@code
+   * maxFailedTurnBackoffMs} — ran out; nothing is typed meanwhile. The reports carry the failure
+   * until a turn ends well. Retried for as long as the session runs.
+   */
+  private void turnFailed(String error) {
+    activity = AgentsDoors.Report.IDLE;
+    typedAt = -1;
+    failedTurns++;
+    long delay = timing.failedTurnBackoffMs();
+    for (int i = 1; i < failedTurns && delay < timing.maxFailedTurnBackoffMs(); i++) {
+      delay = Math.min(timing.maxFailedTurnBackoffMs(), Math.max(1, delay) * 2);
+    }
+    failedUntil = clock.getAsLong() + delay;
+    failureDetail = "turn failed (" + failedTurns + " in a row)" + (error == null ? "" : ": " + error);
+    if (lastTaken != null && retype == null) {
+      retype = lastTaken.again(commandId, -1);
+      tries.remove(retype.key()); // each failure earns the retype its own TAKE_TRIES
+      givenUp.remove(retype.key());
+    }
+    lastTaken = null;
+    LOG.warnf(
+        "AgentKeeper: a turn of %s failed (%d in a row: %s); %s in %d s",
+        commandId,
+        failedTurns,
+        error == null ? "no error named" : error,
+        retype == null ? "typing nothing" : "typing " + retype.what() + " again",
+        delay / 1000);
+    report(AgentsDoors.Report.IDLE, failureDetail);
+    long scheduledIn = epoch;
+    scheduler.schedule(
+        () -> {
+          if (scheduledIn == epoch) {
+            flushOne();
+          }
+        },
+        delay);
+  }
+
+  /** Forgets a failure streak and what it would retype: the session it was about is gone. */
+  private void clearFailures() {
+    lastTaken = null;
+    retype = null;
+    failedTurns = 0;
+    failedUntil = -1;
+    failureDetail = null;
+  }
+
+  /**
+   * Types the next thing into the session, if it is idle, up for the running generation, not still
+   * taking the last one and not backing off a failed turn: what a failed turn put back, else the
+   * resume notice a resumed session owes, else the recovery prompt a fresh session owes, else the
+   * first queued turn.
    */
   private void flushOne() {
     if (stopping || commandId == null || !AgentsDoors.Report.IDLE.equals(activity)) {
@@ -587,7 +735,18 @@ final class AgentKeeper {
     if (launch == null || launch.generation() != runningGeneration) {
       return; // a generation switch is due: the next session gets the turns
     }
+    if (failedUntil >= 0 && clock.getAsLong() < failedUntil) {
+      return; // the failure backoff: its scheduled step flushes again
+    }
     if (typedAt >= 0 && clock.getAsLong() - typedAt < timing.startGraceMs()) {
+      return;
+    }
+    if (retype != null) {
+      typeAgain();
+      return;
+    }
+    if (resumeNoticeOwed) {
+      typeResumeNotice();
       return;
     }
     if (recoveryOwed == runningGeneration) {
@@ -623,6 +782,9 @@ final class AgentKeeper {
       if (typed.recovery()) {
         recoveryOwed = -1; // the session goes on without it; the next fresh one owes it again
       }
+      if (typed.notice()) {
+        resumeNoticeOwed = false; // likewise: the next resumed one owes it again
+      }
       LOG.warnf(
           "AgentKeeper: %s typed into %s was not taken after %d tries; left pending",
           typed.what(), typed.commandId(), TAKE_TRIES);
@@ -633,11 +795,13 @@ final class AgentKeeper {
     LOG.warnf(
         "AgentKeeper: %s typed into %s was not taken within %d s; typing it again",
         typed.what(), typed.commandId(), timing.takeTimeoutMs() / 1000);
-    if (typed.turn() != null) {
+    if (typed.retry()) {
+      retype = typed; // still before anything else; never into the queue, it was acknowledged
+    } else if (typed.turn() != null) {
       queue.removeIf(t -> t.id().equals(typed.turn().id()));
       queue.addFirst(typed.turn()); // first again; a RECOVERY one is still what flushOne owes
     }
-    // A recovery prompt from the row: recoveryOwed was never cleared, so it is typed again.
+    // A recovery prompt from the row or the resume notice: still owed, so it is typed again.
     return true;
   }
 
@@ -650,7 +814,7 @@ final class AgentKeeper {
     }
     queue.remove(turn);
     typedAt = clock.getAsLong();
-    inFlight = new InFlight(commandId, turn, recovery, runningGeneration, typedAt);
+    inFlight = new InFlight(commandId, turn, turn.text(), recovery, false, false, runningGeneration, typedAt);
     tries.merge(inFlight.key(), 1, Integer::sum);
     LOG.infof("AgentKeeper typed %s turn %s into %s", turn.kind(), turn.id(), commandId);
   }
@@ -679,11 +843,36 @@ final class AgentKeeper {
       return;
     }
     typedAt = clock.getAsLong();
-    inFlight = new InFlight(commandId, null, true, runningGeneration, typedAt);
+    inFlight = new InFlight(commandId, null, row.recoveryPrompt(), true, false, false, runningGeneration, typedAt);
     tries.merge(inFlight.key(), 1, Integer::sum);
     LOG.infof(
         "AgentKeeper typed the generation %d recovery prompt into %s (from the agent's row)",
         runningGeneration, commandId);
+  }
+
+  /** What a failed turn put back, typed again; taken, it is not acknowledged a second time. */
+  private void typeAgain() {
+    InFlight again = retype;
+    if (!type(again.text(), again.what())) {
+      return;
+    }
+    retype = null;
+    typedAt = clock.getAsLong();
+    inFlight = again.again(commandId, typedAt);
+    tries.merge(inFlight.key(), 1, Integer::sum);
+    LOG.infof("AgentKeeper typed %s into %s again, after a failed turn", again.what(), commandId);
+  }
+
+  /** The resumed session's {@link ResumeNotice}: typed once, before any queued turn. */
+  private void typeResumeNotice() {
+    String text = ResumeNotice.text();
+    if (!type(text, "the resume notice")) {
+      return;
+    }
+    typedAt = clock.getAsLong();
+    inFlight = new InFlight(commandId, null, text, false, true, false, runningGeneration, typedAt);
+    tries.merge(inFlight.key(), 1, Integer::sum);
+    LOG.infof("AgentKeeper typed the resume notice into %s", commandId);
   }
 
   /** Types {@code text} into the running session; true when it was written. */
@@ -720,6 +909,15 @@ final class AgentKeeper {
           "AgentKeeper: %s taken by %s at generation %d is not acknowledged: the generation is being replaced",
           typed.what(), forCommand, typed.generation());
       return;
+    }
+    lastTaken = typed;
+    if (typed.retry()) {
+      LOG.infof("AgentKeeper: %s took %s again", forCommand, typed.what());
+      return; // acknowledged (or owed) when it was first taken: never twice
+    }
+    if (typed.notice()) {
+      resumeNoticeOwed = false;
+      LOG.infof("AgentKeeper: %s took the resume notice", forCommand);
     }
     if (typed.recovery()) {
       recoveryOwed = -1;
@@ -772,6 +970,9 @@ final class AgentKeeper {
     if (said == null && owedDetail != null) {
       said = owedDetail;
       owedDetail = null;
+    }
+    if (said == null) {
+      said = failureDetail;
     }
     if (said == null) {
       said = pendingDetail.get();

@@ -75,6 +75,11 @@ effort, and an appended system prompt of the overseer brief followed by the laun
   `/workspace/.qits-agents-daemon/sessions` on the kept work volume, records `<generation>
   <sessionId>` for every session the daemon launched for a generation, so a new container never
   resumes the previous generation's session that `launch.sessionId` may still name.
+- A **resumed** session (a crash, an OOM kill, or a new container at the same generation — a spec
+  roll) runs in a new harness process, so every subagent of the old one is gone. It begins with the
+  **resume notice** (`ResumeNotice`: the subagents are gone; list your work, read each item's thread
+  and branches, hand it to a new subagent), typed once before any turn, taken on its
+  `UserPromptSubmit`, at most 3 tries. A fresh session never gets it.
 - A newer generation ends the session and launches a fresh one; RECOVERY is its first turn.
 - Every fresh session past generation 1 begins with its generation's recovery prompt: the pending
   RECOVERY turn of that generation, else the row's `recoveryPrompt` (`GET .../agents/{name}`) when
@@ -86,6 +91,13 @@ effort, and an appended system prompt of the overseer brief followed by the laun
   Not taken within 120 s while the session idles, it is typed again, at most 3 times in all; then it
   is left pending (unacknowledged), the next report's `detail` reads `turn <id> not taken after 3
   tries`, and the later turns go on.
+- A **failed turn** — Claude's `StopFailure` hook, an API error ended the turn — leaves the session
+  idle but the turn lost. The keeper keeps its own copy of what the session last took (a turn, the
+  recovery prompt or the resume notice) and types it again, before anything else, after a backoff of
+  1 min doubling to 30 min, for as long as the generation stands; nothing is typed meanwhile. The
+  turn was acknowledged when first taken and is never acknowledged again. Reports are IDLE with
+  `detail` `turn failed (<n> in a row): <error>` until a turn ends well: a `Stop`, never the
+  idle-prompt Notification that follows a failed turn too. A launch forgets the streak.
 - Reports: STARTING at launch, IDLE/BUSY from the harness hooks (loopback webhook on 127.0.0.1:13337),
   EXITED or FAILED on exit, always with the running generation and a session id the ledger does not
   place at another generation.
@@ -128,6 +140,11 @@ after 60 s of silence, and followed by a full catch-up (backstop + `launch`) aft
 | `INFO AgentKeeper typed <KIND> turn <id> into <command>` | a turn was typed into the session |
 | `INFO AgentKeeper typed the generation <n> recovery prompt into <command> (from the agent's row)` | a fresh session's recovery prompt, its RECOVERY turn already acknowledged |
 | `INFO AgentKeeper: <command> took the generation <n> recovery prompt` | the session submitted it |
+| `INFO AgentKeeper typed the resume notice into <command>` | a resumed session is told its subagents are gone |
+| `INFO AgentKeeper: <command> took the resume notice` | the session submitted it |
+| `WARN AgentKeeper: a turn of <command> failed (<n> in a row: <error>); typing <what> again in <s> s` | a StopFailure; the backoff runs |
+| `INFO AgentKeeper typed <what> into <command> again, after a failed turn` | the backoff ran out |
+| `INFO AgentKeeper: <command> ended a turn well after <n> failed ones` | the failure streak ended |
 | `INFO AgentKeeper acknowledged <KIND> turn <id>` | `delivered` landed, after the session took the turn |
 | `INFO AgentKeeper: <what> typed into <command> was not taken; it stays pending` | the session ended first |
 | `WARN AgentKeeper: <what> typed into <command> was not taken within <n> s; typing it again` | no BUSY for it while idle; retyped |
