@@ -18,8 +18,10 @@ import org.jboss.logging.Logger;
  *
  * <ul>
  *   <li>{@code StopFailure} — Claude's Stop when an API error ended the turn — is {@value
- *       #FAILED_TURN}, its {@code error} and {@code error_details} handed over as one line of at
- *       most {@value #ERROR_LIMIT} characters ({@code server_error: Unable to connect to API}).
+ *       #FAILED_TURN}, its {@code error} and {@code error_details} (falling back to {@code
+ *       last_assistant_message} when {@code error_details} is absent, as it routinely is) handed
+ *       over as one line of at most {@value #ERROR_LIMIT} characters ({@code server_error: Unable
+ *       to connect to API}).
  *   <li>The idle-prompt Notification (Claude's "waiting for your input", some 60 s after a turn
  *       ended) is {@value #IDLE_PROMPT}: idle, but no proof that a turn succeeded — it follows a
  *       failed turn as surely as a good one. Only a Stop (or a SessionStart) is IDLE to the keeper.
@@ -130,11 +132,17 @@ final class HookWebhook {
 
   /**
    * A StopFailure's {@code error} and {@code error_details}, as {@code <error>: <details>} on one
-   * line of at most {@value #ERROR_LIMIT} characters; null when it names neither.
+   * line of at most {@value #ERROR_LIMIT} characters; null when it names neither. {@code
+   * error_details} is routinely absent (a real 2.1.283 payload carries only {@code error} and
+   * {@code null}), so when it is absent, blank or not a string, {@code last_assistant_message} —
+   * the actual API error text — is used in its place instead.
    */
   static String error(JsonObject body) {
     String category = text(body.getValue("error"));
     String details = text(body.getValue("error_details"));
+    if (details == null) {
+      details = text(body.getValue("last_assistant_message"));
+    }
     String said =
         category == null ? details : details == null ? category : category + ": " + details;
     if (said == null) {

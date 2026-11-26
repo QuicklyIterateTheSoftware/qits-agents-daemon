@@ -46,6 +46,39 @@ class HookWebhookTest {
   }
 
   @Test
+  void aRealStopFailurePayloadFallsBackToTheLastAssistantMessageWhenDetailsIsNull() {
+    // Captured live from Claude Code 2.1.283: error_details is null, so the real cause
+    // (here, a connection failure) would otherwise be lost behind the bare category.
+    assertEquals(
+        "server_error: API Error: Connection refused — a firewall or proxy may be blocking it"
+            + " (ECONNREFUSED)",
+        HookWebhook.error(
+            new JsonObject()
+                .put("hook_event_name", "StopFailure")
+                .put("error", "server_error")
+                .putNull("error_details")
+                .put(
+                    "last_assistant_message",
+                    "API Error: Connection refused — a firewall or proxy may be blocking it"
+                        + " (ECONNREFUSED)")));
+  }
+
+  @Test
+  void errorDetailsWinsOverLastAssistantMessageWhenBothArePresent() {
+    assertEquals(
+        "server_error: Unable to connect to API: Self-signed certificate detected"
+            + " (SELF_SIGNED_CERT_IN_CHAIN)",
+        HookWebhook.error(
+            new JsonObject()
+                .put("error", "server_error")
+                .put(
+                    "error_details",
+                    "Unable to connect to API: Self-signed certificate detected"
+                        + " (SELF_SIGNED_CERT_IN_CHAIN)")
+                .put("last_assistant_message", "API Error: something else entirely")));
+  }
+
+  @Test
   void theErrorTextIsTheCategoryAloneWithoutDetailsAndCappedAtTheLimit() {
     assertEquals("rate_limit", HookWebhook.error(new JsonObject().put("error", "rate_limit").putNull("error_details")));
     assertNull(HookWebhook.error(new JsonObject()));
