@@ -6,13 +6,16 @@ import eu.wohlben.qits.pact.consumer.ConsumerPact;
 import eu.wohlben.qits.pact.consumer.GoldenInteraction;
 import eu.wohlben.qits.pact.consumer.GoldenMasters;
 import eu.wohlben.qits.pact.consumer.Trigger;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
 /**
- * <b>What this daemon asks qits-agents-service, and why</b>: the four runner doors of qits-2518,
+ * <b>What this daemon asks qits-agents-service, and why</b>: the runner doors of qits-2518 and the
+ * usage door of qits-2521,
  * each for the agent's own row and with the agent's own bearer — the provider state {@value
  * #STATE}, whose {@code authorization} param is that bearer.
  *
@@ -22,6 +25,8 @@ import org.junit.jupiter.api.Test;
  *   <li>{@code listAgentTurns}: the undelivered turns, every 10 s and right after a launch;
  *   <li>{@code markAgentTurnDelivered}: once a turn was typed into the session;
  *   <li>{@code reportAgent}: on every session state change;
+ *   <li>{@code recordAgentUsage}: the token usage of the session's new assistant messages, by
+ *       {@code UsageScanner} as the transcript grows;
  *   <li>{@code getAgent}: the row's {@code generation} and {@code recoveryPrompt}, when a fresh
  *       session past the first generation owes its recovery prompt and no RECOVERY turn of that
  *       generation is pending (one already acknowledged by a container that died). The provider
@@ -64,6 +69,11 @@ class AgentsServicePactTest {
       GoldenInteraction.of(Trigger.event("the session's state changed"), STATE, "reportAgent")
           .header("Authorization", "{authorization}");
 
+  static final GoldenInteraction USAGE =
+      GoldenInteraction.of(
+              Trigger.event("the session's transcript grew"), STATE, "recordAgentUsage")
+          .header("Authorization", "{authorization}");
+
   static final String ROW_STATE = "a running agent";
 
   static final GoldenInteraction AGENT =
@@ -74,7 +84,7 @@ class AgentsServicePactTest {
           .consumes("generation", "recoveryPrompt");
 
   static final ConsumerPact PACT =
-      ConsumerPact.of(CONSUMER, AGENTS, LAUNCH, TURNS, DELIVERED, REPORT, AGENT);
+      ConsumerPact.of(CONSUMER, AGENTS, LAUNCH, TURNS, DELIVERED, REPORT, USAGE, AGENT);
 
   @Test
   void theKeeperReadsTheLaunch() {
@@ -131,6 +141,32 @@ class AgentsServicePactTest {
   }
 
   @Test
+  void theScannerReportsTheSessionsUsage() {
+    PACT.run(
+        USAGE,
+        (url, recorded) -> {
+          var body = recorded.body();
+          List<AgentsDoors.UsageMessage> messages = new ArrayList<>();
+          for (var message : body.path("messages")) {
+            messages.add(
+                new AgentsDoors.UsageMessage(
+                    message.path("messageId").asText(),
+                    message.path("workQualifiedId").isNull()
+                        ? null
+                        : message.path("workQualifiedId").asText(),
+                    message.path("model").asText(),
+                    message.path("inputTokens").asLong(),
+                    message.path("outputTokens").asLong(),
+                    message.path("cacheCreationTokens").asLong(),
+                    message.path("cacheReadTokens").asLong(),
+                    Instant.parse(message.path("at").asText())));
+          }
+          doors(url, recorded.params())
+              .usage(new AgentsDoors.UsageReport(body.path("sessionId").asText(), messages));
+        });
+  }
+
+  @Test
   void theKeeperReadsTheRecoveryPromptFromTheRow() {
     PACT.run(
         AGENT,
@@ -157,7 +193,7 @@ class AgentsServicePactTest {
   @Test
   void everyInteractionCarriesBothReferences() {
     PACT.assertEveryInteractionCarriesBothReferences();
-    assertEquals(5, PACT.recorded().size(), "every row is recorded: " + PACT.unrecorded());
+    assertEquals(6, PACT.recorded().size(), "every row is recorded: " + PACT.unrecorded());
   }
 
   /** The doors at the mock's {@code /agents}, with the state's bearer as the agent's token. */

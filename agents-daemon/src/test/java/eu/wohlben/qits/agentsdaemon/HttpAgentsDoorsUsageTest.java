@@ -20,10 +20,8 @@ import org.junit.jupiter.api.Test;
 /**
  * The usage door over HTTP, against a local server: path, bearer and body as qits-agents-service's
  * {@code AgentsWire.UsageReport} reads them, and a non-204 answer as {@link
- * AgentsDoors.Unavailable}.
- *
- * <p>Not yet a row of {@link AgentsServicePactTest}: that row needs the provider's recording of the
- * door in its published golden masters, and the door is released by qits-agents-service first.
+ * AgentsDoors.Unavailable}. The provider's own recording of the door is the {@code recordAgentUsage}
+ * row of {@link AgentsServicePactTest}.
  */
 class HttpAgentsDoorsUsageTest {
 

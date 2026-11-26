@@ -492,6 +492,94 @@
         "status": 204
       },
       "type": "Synchronous/HTTP"
+    },
+    {
+      "comments": {
+        "references": {
+          "qits-call": {
+            "app": "qits-agents-service",
+            "operationId": "recordAgentUsage"
+          },
+          "qits-trigger": {
+            "app": "qits-agents-daemon",
+            "event": "the session's transcript grew",
+            "kind": "event"
+          }
+        }
+      },
+      "description": "the session's transcript grew: recordAgentUsage",
+      "key": "66c276db",
+      "pending": false,
+      "providerStates": [
+        {
+          "name": "a running agent calling as itself",
+          "params": {
+            "authorization": "Bearer qits_tok_contract-developer",
+            "name": "developer",
+            "project": "qits",
+            "turnId": "00000000-0000-4000-8000-000000000001"
+          }
+        }
+      ],
+      "request": {
+        "body": {
+          "content": {
+            "messages": [
+              {
+                "at": "2026-11-26T10:00:00Z",
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 51234,
+                "inputTokens": 12,
+                "messageId": "msg_contract_1",
+                "model": "claude-opus-5-5",
+                "outputTokens": 340,
+                "workQualifiedId": "qits-101"
+              },
+              {
+                "at": "2026-11-26T10:01:00Z",
+                "cacheCreationTokens": 100,
+                "cacheReadTokens": 0,
+                "inputTokens": 3,
+                "messageId": "msg_contract_2",
+                "model": "claude-opus-5-5",
+                "outputTokens": 20,
+                "workQualifiedId": null
+              }
+            ],
+            "sessionId": "session-contract"
+          },
+          "contentType": "application/json",
+          "encoded": false
+        },
+        "generators": {
+          "header": {
+            "Authorization": {
+              "dataType": "RAW",
+              "expression": "${authorization}",
+              "type": "ProviderState"
+            }
+          },
+          "path": {
+            "dataType": "RAW",
+            "expression": "/agents/api/projects/${project}/agents/${name}/usage",
+            "type": "ProviderState"
+          }
+        },
+        "headers": {
+          "Authorization": [
+            "Bearer qits_tok_contract-developer"
+          ],
+          "Content-Type": [
+            "application/json"
+          ]
+        },
+        "method": "POST",
+        "path": "/agents/api/projects/qits/agents/developer/usage"
+      },
+      "response": {
+        "status": 204
+      },
+      "type": "Synchronous/HTTP"
     }
   ],
   "metadata": {
