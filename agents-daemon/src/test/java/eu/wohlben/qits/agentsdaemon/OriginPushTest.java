@@ -108,6 +108,81 @@ class OriginPushTest {
     assertNull(fx.originRef("beta", "ticket/qits-5"));
   }
 
+  /** Installs a {@code pre-receive} hook on {@code repo}'s origin that always refuses the push. */
+  private void refuseAlways(String repo) {
+    refuseUnlessMarked(repo, tmp.resolve("no-such-marker-" + repo));
+  }
+
+  /** Installs a {@code pre-receive} hook that refuses every push until {@code marker} exists. */
+  private void refuseUnlessMarked(String repo, Path marker) {
+    Path hook = fx.origins.resolve(repo).resolve("hooks/pre-receive");
+    GitFixture.write(
+        hook,
+        "#!/bin/sh\n"
+            + "if [ -f \"" + marker + "\" ]; then exit 0; fi\n"
+            + "echo 'scope not yet granted' >&2\n"
+            + "exit 1\n");
+    assertTrue(hook.toFile().setExecutable(true), "hook must be executable");
+  }
+
+  @Test
+  void aRefusedTipIsNotRetriedBeforeTheBackoff() {
+    long[] now = {0L};
+    push = new OriginPush(fx.git, fx.checkout, () -> now[0]);
+    fx.ok(fx.git.in(fx.sub("alpha"), "switch", "-q", "-c", "ticket/qits-10"));
+    commit(fx.sub("alpha"), "a.txt");
+    refuseAlways("alpha");
+
+    assertEquals(Map.of("alpha ticket/qits-10", OriginPush.Outcome.REFUSED), push.cycle());
+
+    now[0] += OriginPush.REFUSAL_BACKOFF_INITIAL_MILLIS - 1;
+    assertTrue(push.cycle().isEmpty(), "not retried before the backoff elapses");
+  }
+
+  @Test
+  void aRefusedTipIsRetriedAfterTheBackoffAndPushedOnceAccepted() {
+    long[] now = {0L};
+    push = new OriginPush(fx.git, fx.checkout, () -> now[0]);
+    fx.ok(fx.git.in(fx.sub("alpha"), "switch", "-q", "-c", "ticket/qits-11"));
+    String tip = commit(fx.sub("alpha"), "a.txt");
+    Path marker = tmp.resolve("accept-alpha");
+    refuseUnlessMarked("alpha", marker);
+
+    assertEquals(Map.of("alpha ticket/qits-11", OriginPush.Outcome.REFUSED), push.cycle());
+    assertNull(fx.originRef("alpha", "ticket/qits-11"));
+
+    now[0] += OriginPush.REFUSAL_BACKOFF_INITIAL_MILLIS;
+    GitFixture.write(marker, "ok\n");
+    assertEquals(Map.of("alpha ticket/qits-11", OriginPush.Outcome.PUSHED), push.cycle());
+    assertEquals(tip, fx.originRef("alpha", "ticket/qits-11"));
+  }
+
+  @Test
+  void theBackoffDoublesThenCapsAtTheMaximum() {
+    long[] now = {0L};
+    push = new OriginPush(fx.git, fx.checkout, () -> now[0]);
+    fx.ok(fx.git.in(fx.sub("alpha"), "switch", "-q", "-c", "ticket/qits-12"));
+    commit(fx.sub("alpha"), "a.txt");
+    refuseAlways("alpha");
+
+    assertEquals(Map.of("alpha ticket/qits-12", OriginPush.Outcome.REFUSED), push.cycle());
+
+    long expected = OriginPush.REFUSAL_BACKOFF_INITIAL_MILLIS;
+    while (expected < OriginPush.REFUSAL_BACKOFF_MAX_MILLIS) {
+      now[0] += expected - 1;
+      assertTrue(push.cycle().isEmpty(), "not retried before " + expected + "ms of backoff");
+      now[0] += 1;
+      assertEquals(Map.of("alpha ticket/qits-12", OriginPush.Outcome.REFUSED), push.cycle());
+      expected = Math.min(expected * 2, OriginPush.REFUSAL_BACKOFF_MAX_MILLIS);
+    }
+
+    // backoff is now pinned at the cap: confirm it never grows past it.
+    now[0] += OriginPush.REFUSAL_BACKOFF_MAX_MILLIS - 1;
+    assertTrue(push.cycle().isEmpty(), "the capped backoff is not retried early");
+    now[0] += 1;
+    assertEquals(Map.of("alpha ticket/qits-12", OriginPush.Outcome.REFUSED), push.cycle());
+  }
+
   @Test
   void theRefusalQuotesTheHostsOwnLine() {
     String output =

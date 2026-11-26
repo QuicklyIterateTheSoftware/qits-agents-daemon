@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.LongSupplier;
 import org.jboss.logging.Logger;
 
 /**
@@ -21,8 +22,15 @@ import org.jboss.logging.Logger;
  * so walking each repository once covers the branches its worktrees have checked out.
  *
  * <p>A refusal — a non-fast-forward, or the git host rejecting a commit subject — logs {@code WARN
- * OriginPush refused <R> <branch>: <first line>} and is retried only when the branch tip changes,
- * never with force. A failure that is not a refusal (the network, a lock) is tried again next cycle.
+ * OriginPush refused <R> <branch>: <first line>} the first time a tip is refused, never with force.
+ * A changed tip is retried at once, as always; qits-2705: an unchanged tip is retried too, after a
+ * backoff ({@link #REFUSAL_BACKOFF_INITIAL_MILLIS}, doubling, capped at {@link
+ * #REFUSAL_BACKOFF_MAX_MILLIS}), because a project agent's push scope is widened asynchronously when
+ * an item is assigned to it and the edge can cache the old, narrower introspection for up to 15 s —
+ * without a retry, a commit made right after the assignment is refused once and stranded forever. A
+ * repeated refusal of the same tip with the same first line logs at DEBUG instead of WARN, so the
+ * retries do not spam the log; one that later succeeds logs the normal {@code pushed} line. A
+ * failure that is not a refusal (the network, a lock) is tried again next cycle regardless.
  * {@code main} and detached HEADs are never pushed.
  *
  * <p>Modelled on {@code OriginSync} in qits-workspace-daemon, without its per-agent seats: this
@@ -31,6 +39,12 @@ import org.jboss.logging.Logger;
 final class OriginPush {
 
   private static final Logger LOG = Logger.getLogger(OriginPush.class);
+
+  /** The first retry after a refusal of an unchanged tip. */
+  static final long REFUSAL_BACKOFF_INITIAL_MILLIS = 60_000L;
+
+  /** The backoff doubles after every repeated refusal, up to this cap. */
+  static final long REFUSAL_BACKOFF_MAX_MILLIS = 30 * 60_000L;
 
   /** One repository: its common git dir (its identity), a directory to run git in, its name. */
   record Repository(Path commonDir, Path workDir, String name) {}
@@ -42,18 +56,30 @@ final class OriginPush {
     FAILED
   }
 
+  /** A tip refused, when it may be tried again, the backoff that earned that wait, and its line. */
+  private record Refusal(String tip, long nextTryAtMillis, long backoffMillis, String line) {}
+
   private final Git git;
   private final Checkout checkout;
+  private final LongSupplier clock;
 
-  /** Per repository and branch, the tip last pushed or refused: not tried again until it moves. */
+  /** Per repository and branch, the tip last pushed or already on origin: never retried. */
   private final Map<String, String> handled = new ConcurrentHashMap<>();
+
+  /** Per repository and branch, the last refusal: retried on a backoff even if the tip holds. */
+  private final Map<String, Refusal> refusals = new ConcurrentHashMap<>();
 
   /** Per repository and branch, the last transient failure warned, so it warns once per message. */
   private final Map<String, String> failing = new ConcurrentHashMap<>();
 
   OriginPush(Git git, Checkout checkout) {
+    this(git, checkout, System::currentTimeMillis);
+  }
+
+  OriginPush(Git git, Checkout checkout, LongSupplier clock) {
     this.git = git;
     this.checkout = checkout;
+    this.clock = clock;
   }
 
   /** One cycle. Answers what it did, per {@code <repository> <branch>}. */
@@ -73,32 +99,46 @@ final class OriginPush {
         if (tip.equals(handled.get(key))) {
           continue;
         }
+        Refusal refusal = refusals.get(key);
+        if (refusal != null && tip.equals(refusal.tip()) && clock.getAsLong() < refusal.nextTryAtMillis()) {
+          continue; // the same tip, still waiting out its backoff
+        }
         Git.Result ahead = git.in(repo.workDir(), "rev-list", "--count", tip, "--not", "--remotes=origin");
         if (ahead.ok() && "0".equals(ahead.line())) {
           handled.put(key, tip);
+          refusals.remove(key);
           continue;
         }
-        Outcome outcome = push(repo, branch, tip, key);
+        Outcome outcome = push(repo, branch, tip, key, refusal);
         done.put(repo.name() + " " + branch, outcome);
       }
     }
     return done;
   }
 
-  private Outcome push(Repository repo, String branch, String tip, String key) {
+  private Outcome push(Repository repo, String branch, String tip, String key, Refusal previous) {
     String refspec = "refs/heads/" + branch + ":refs/heads/" + branch;
     Git.Result pushed = git.in(repo.workDir(), "push", "--porcelain", "origin", refspec);
     if (pushed.ok()) {
       handled.put(key, tip);
+      refusals.remove(key);
       failing.remove(key);
       LOG.infof("OriginPush pushed %s %s %s", repo.name(), branch, MainFollower.short7(tip));
       return Outcome.PUSHED;
     }
     String output = pushed.stderr() + "\n" + pushed.stdout();
     if (refused(output)) {
-      handled.put(key, tip);
+      String line = firstLine(output);
+      boolean repeat = previous != null && tip.equals(previous.tip()) && line.equals(previous.line());
+      long backoff =
+          repeat ? Math.min(previous.backoffMillis() * 2, REFUSAL_BACKOFF_MAX_MILLIS) : REFUSAL_BACKOFF_INITIAL_MILLIS;
+      refusals.put(key, new Refusal(tip, clock.getAsLong() + backoff, backoff, line));
       failing.remove(key);
-      LOG.warnf("OriginPush refused %s %s: %s", repo.name(), branch, firstLine(output));
+      if (repeat) {
+        LOG.debugf("OriginPush refused %s %s: %s", repo.name(), branch, line);
+      } else {
+        LOG.warnf("OriginPush refused %s %s: %s", repo.name(), branch, line);
+      }
       return Outcome.REFUSED;
     }
     String line = firstLine(output);
