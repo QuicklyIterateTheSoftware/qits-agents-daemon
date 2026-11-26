@@ -36,10 +36,19 @@ import org.jboss.logging.Logger;
  * <p>A session's transcripts are {@code <claudeMount>/.claude/projects/<escaped-cwd>/<sessionId>.jsonl}
  * and its subagents' {@code <sessionId>/subagents/agent-*.jsonl} beside it, the files {@code
  * AgentTranscriptService} imports. Each is read from the offset this scanner reached, complete lines
- * only, through {@link TranscriptUsage}; a {@code message.id} counts once per session. A message's
- * {@code cwd} under {@code /workspace/worktrees/<qualified id>/} — the worktrees {@link
- * OverseerBrief} prescribes — attributes it to that work item; anything else is the agent's own
- * overhead ({@code workQualifiedId} null).
+ * only, through {@link TranscriptUsage}; a {@code message.id} counts once per session.
+ *
+ * <p>A message is attributed to a work item, in this order:
+ *
+ * <ol>
+ *   <li>its line's own {@code cwd} under {@code /workspace/worktrees/<qualified id>/}, the worktrees
+ *       {@link OverseerBrief} prescribes;
+ *   <li>in a subagent's file, the item its task prompt (the file's first user message) names: the
+ *       first {@code /workspace/worktrees/<qualified id>/} path in it, else the first bare {@code
+ *       <project>-<n>}. A subagent's lines carry its parent session's {@code cwd}, not the worktree
+ *       it works in, so rule 1 alone attributes nothing a subagent does;
+ *   <li>else none ({@code workQualifiedId} null): the agent's own overhead.
+ * </ol>
  *
  * <p>Offsets live in memory: a new container rescans from 0, and the door's dedupe on {@code
  * (sessionId, messageId)} absorbs the repeats. A session's offsets move only once all its batches
@@ -54,9 +63,14 @@ final class UsageScanner {
 
   static final Pattern WORKTREE = Pattern.compile("^/workspace/worktrees/([a-z][a-z0-9-]*-[0-9]+)(/|$)");
 
+  /** A worktree path anywhere in a task prompt. */
+  static final Pattern WORKTREE_IN_TEXT = Pattern.compile("/workspace/worktrees/([a-z][a-z0-9-]*-[0-9]+)/");
+
   private final Path projectsRoot;
   private final Supplier<Collection<String>> sessions;
   private final AgentsDoors doors;
+  /** A bare qualified id of this project, {@code <project>-<n>}, in a task prompt. */
+  private final Pattern qualifiedId;
 
   /** Per session: where each of its files was read up to, and the message ids already sent. */
   private final Map<String, SessionState> states = new HashMap<>();
@@ -67,14 +81,28 @@ final class UsageScanner {
     Path main;
     final Map<Path, Long> offsets = new HashMap<>();
     final Set<String> sent = new HashSet<>();
+    /** Per subagent file: the item its task prompt names, once that prompt was read. */
+    final Map<Path, Sidechain> sidechains = new HashMap<>();
+  }
+
+  /**
+   * What a subagent file's task prompt names. Derived from the file's content alone, so it is kept
+   * even when the send of its messages fails.
+   */
+  private static final class Sidechain {
+    boolean promptRead;
+    String workQualifiedId;
   }
 
   /**
    * @param projectsRoot {@code <claudeMount>/.claude/projects}
+   * @param project the project's slug, the prefix of its qualified ids
    * @param sessions the session ids to cover, read on every tick
    */
-  UsageScanner(Path projectsRoot, Supplier<Collection<String>> sessions, AgentsDoors doors) {
+  UsageScanner(
+      Path projectsRoot, String project, Supplier<Collection<String>> sessions, AgentsDoors doors) {
     this.projectsRoot = projectsRoot;
+    this.qualifiedId = Pattern.compile("\\b(" + Pattern.quote(project) + "-[0-9]+)\\b");
     this.sessions = sessions;
     this.doors = doors;
   }
@@ -109,7 +137,18 @@ final class UsageScanner {
     Map<String, AgentsDoors.UsageMessage> fresh = new LinkedHashMap<>();
     for (Path file : files(state.main, sessionId)) {
       long from = state.offsets.getOrDefault(file, 0L);
-      long to = read(file, from, line -> collect(line, state, fresh));
+      if (size(file) < from) {
+        from = 0; // replaced: read it again
+      }
+      Sidechain sidechain = null;
+      if (!file.equals(state.main)) {
+        if (from == 0) {
+          state.sidechains.remove(file);
+        }
+        sidechain = state.sidechains.computeIfAbsent(file, f -> new Sidechain());
+      }
+      Sidechain within = sidechain;
+      long to = read(file, from, line -> collect(line, within, state, fresh));
       if (to != from) {
         reached.put(file, to);
       }
@@ -133,8 +172,19 @@ final class UsageScanner {
     return true;
   }
 
-  private static void collect(
-      String line, SessionState state, Map<String, AgentsDoors.UsageMessage> fresh) {
+  private void collect(
+      String line,
+      Sidechain sidechain,
+      SessionState state,
+      Map<String, AgentsDoors.UsageMessage> fresh) {
+    if (sidechain != null && !sidechain.promptRead) {
+      TranscriptUsage.userText(line)
+          .ifPresent(
+              prompt -> {
+                sidechain.promptRead = true;
+                sidechain.workQualifiedId = promptWorkQualifiedId(prompt);
+              });
+    }
     TranscriptUsage.of(line)
         .filter(u -> !state.sent.contains(u.messageId()) && !fresh.containsKey(u.messageId()))
         .ifPresent(
@@ -143,13 +193,39 @@ final class UsageScanner {
                     u.messageId(),
                     new AgentsDoors.UsageMessage(
                         u.messageId(),
-                        workQualifiedId(u.cwd()),
+                        attribute(u.cwd(), sidechain),
                         u.model(),
                         u.inputTokens(),
                         u.outputTokens(),
                         u.cacheCreationTokens(),
                         u.cacheReadTokens(),
                         u.at() == null ? Instant.now() : u.at())));
+  }
+
+  private static String attribute(String cwd, Sidechain sidechain) {
+    String byCwd = workQualifiedId(cwd);
+    if (byCwd != null || sidechain == null) {
+      return byCwd;
+    }
+    return sidechain.workQualifiedId;
+  }
+
+  /** The item a task prompt names: its first worktree path, else its first bare qualified id. */
+  String promptWorkQualifiedId(String prompt) {
+    Matcher worktree = WORKTREE_IN_TEXT.matcher(prompt);
+    if (worktree.find()) {
+      return worktree.group(1);
+    }
+    Matcher bare = qualifiedId.matcher(prompt);
+    return bare.find() ? bare.group(1) : null;
+  }
+
+  private static long size(Path file) {
+    try {
+      return Files.size(file);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
   /** The work item a working directory under {@code /workspace/worktrees/<qid>/} names, else null. */

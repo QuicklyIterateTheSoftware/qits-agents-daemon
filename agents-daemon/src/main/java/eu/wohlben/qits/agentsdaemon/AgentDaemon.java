@@ -169,6 +169,7 @@ public class AgentDaemon {
     UsageScanner scanner =
         new UsageScanner(
             Path.of(config.claudeMount(), ".claude", "projects"),
+            config.project(),
             () -> {
               // The running session, and the earlier ones of its generation.
               Set<String> sessions = new LinkedHashSet<>(ledger.sessionsAt(keeper.generation()));

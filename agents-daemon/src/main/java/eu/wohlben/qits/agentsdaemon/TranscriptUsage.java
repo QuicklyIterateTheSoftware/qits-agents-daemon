@@ -1,5 +1,6 @@
 package eu.wohlben.qits.agentsdaemon;
 
+import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
@@ -55,6 +56,42 @@ final class TranscriptUsage {
               number(usage, "cache_read_input_tokens"),
               instant(line.getValue("timestamp")),
               line.getValue("cwd") instanceof String cwd ? cwd : null));
+    } catch (RuntimeException e) {
+      LOG.debugf("TranscriptUsage skipped a line that does not parse: %s", e.getMessage());
+      return Optional.empty();
+    }
+  }
+
+  /**
+   * The text of a {@code "type":"user"} line's message: its {@code content} string, or its {@code
+   * text} blocks joined. Empty for any other line, a tool result, or a line that does not parse.
+   */
+  static Optional<String> userText(String jsonLine) {
+    if (jsonLine == null || jsonLine.isBlank()) {
+      return Optional.empty();
+    }
+    try {
+      JsonObject line = new JsonObject(jsonLine);
+      if (!"user".equals(line.getValue("type"))
+          || !(line.getValue("message") instanceof JsonObject message)) {
+        return Optional.empty();
+      }
+      Object content = message.getValue("content");
+      if (content instanceof String text) {
+        return Optional.of(text);
+      }
+      if (content instanceof JsonArray blocks) {
+        StringBuilder text = new StringBuilder();
+        for (Object block : blocks) {
+          if (block instanceof JsonObject b
+              && "text".equals(b.getValue("type"))
+              && b.getValue("text") instanceof String t) {
+            text.append(t).append('\n');
+          }
+        }
+        return text.isEmpty() ? Optional.empty() : Optional.of(text.toString());
+      }
+      return Optional.empty();
     } catch (RuntimeException e) {
       LOG.debugf("TranscriptUsage skipped a line that does not parse: %s", e.getMessage());
       return Optional.empty();

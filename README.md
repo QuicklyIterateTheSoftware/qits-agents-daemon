@@ -99,7 +99,10 @@ the running generation: reads `/claude-home/.claude/projects/*/<sessionId>.jsonl
 assistant `message.id`'s usage once per session (the first line wins; a missing number is 0), and
 posts the new messages in batches of at most 500 to `POST .../agents/{name}/usage` with the agent's
 bearer. A message whose `cwd` is under `/workspace/worktrees/<qualified id>/` is attributed to that
-item, anything else is null (the overseer's own overhead). Offsets live in memory and move only once
+item. A subagent's lines carry its parent's `cwd`, so a message in `subagents/agent-*.jsonl` is
+otherwise attributed to the item its task prompt (the file's first user message) names: the first
+`/workspace/worktrees/<qualified id>/` path in it, else the first bare `<project>-<n>`. Anything else
+is null (the overseer's own overhead). Offsets live in memory and move only once
 the session's batches were accepted: a failed call is retried whole on the next tick, and a new
 container rescans from 0; the door's dedupe on `(sessionId, messageId)` absorbs the repeats.
 

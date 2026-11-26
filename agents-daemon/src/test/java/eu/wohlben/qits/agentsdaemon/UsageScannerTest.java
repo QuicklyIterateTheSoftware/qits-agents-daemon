@@ -4,6 +4,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.vertx.core.json.JsonArray;
+import io.vertx.core.json.JsonObject;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -32,7 +34,7 @@ class UsageScannerTest {
   Path dir;
 
   UsageScanner scanner() {
-    return new UsageScanner(projects, () -> sessions, doors);
+    return new UsageScanner(projects, "qits", () -> sessions, doors);
   }
 
   @Test
@@ -77,6 +79,66 @@ class UsageScannerTest {
 
     scanner.tick();
     assertEquals(2, doors.reports.size(), "nothing new, nothing sent");
+  }
+
+  @Test
+  void aSubagentIsAttributedByTheItemItsTaskPromptNames() throws IOException {
+    // The overseer's own session names an item in its prompt, and stays its overhead.
+    append(
+        main(),
+        user("Work on qits-2565 in /workspace/worktrees/qits-2565/qits-qits/"),
+        assistant("msg_main", "/workspace/qits-qits", 1, 1));
+    // A subagent's lines carry the parent's cwd; its task prompt names the worktree.
+    append(
+        sidechain("agent-a1"),
+        userBlocks(
+            "Implement task qits-2565 (epic qits-2521). Work in"
+                + " /workspace/worktrees/qits-2565/qits-qits/components/x only."),
+        assistant("msg_w", "/workspace/qits-qits", 1, 1),
+        user("a later message naming /workspace/worktrees/qits-9999/qits-qits/ changes nothing"),
+        assistant("msg_w2", "/workspace/qits-qits", 1, 1));
+    // A prompt naming only a bare id of the project.
+    Path bare = sidechain("agent-a2");
+    append(
+        bare,
+        user("Review the branch of qits-2570, not epic-12; see qits-qits."),
+        assistant("msg_b", "/workspace/qits-qits", 1, 1));
+    // A prompt naming nothing.
+    append(sidechain("agent-a3"), user("Find the README."), assistant("msg_n", "/workspace/qits-qits", 1, 1));
+    // The line's own worktree cwd still wins.
+    append(
+        sidechain("agent-a4"),
+        user("Work on qits-2570."),
+        assistant("msg_c", "/workspace/worktrees/qits-2565/qits-qits", 1, 1));
+
+    UsageScanner scanner = scanner();
+    scanner.tick();
+    Map<String, AgentsDoors.UsageMessage> byId = byId(doors.reports.getFirst());
+    assertNull(byId.get("msg_main").workQualifiedId(), "the main session is overhead");
+    assertEquals("qits-2565", byId.get("msg_w").workQualifiedId());
+    assertEquals("qits-2565", byId.get("msg_w2").workQualifiedId(), "only the first user message counts");
+    assertEquals("qits-2570", byId.get("msg_b").workQualifiedId());
+    assertNull(byId.get("msg_n").workQualifiedId());
+    assertEquals("qits-2565", byId.get("msg_c").workQualifiedId());
+
+    // The file's item is remembered for its later messages, read on a later tick.
+    append(bare, assistant("msg_b2", "/workspace/qits-qits", 1, 1));
+    scanner.tick();
+    assertEquals("qits-2570", byId(doors.reports.get(1)).get("msg_b2").workQualifiedId());
+  }
+
+  @Test
+  void aFailedSendKeepsTheSubagentsItem() throws IOException {
+    main();
+    Path file = sidechain("agent-a1");
+    append(file, user("Work in /workspace/worktrees/qits-2565/qits-qits/."));
+    UsageScanner scanner = scanner();
+    scanner.tick();
+    append(file, assistant("msg_w", "/workspace/qits-qits", 1, 1));
+    doors.failures = 1;
+    scanner.tick();
+    scanner.tick();
+    assertEquals("qits-2565", byId(doors.reports.getFirst()).get("msg_w").workQualifiedId());
   }
 
   @Test
@@ -185,6 +247,29 @@ class UsageScannerTest {
         + ",\"output_tokens\":"
         + output
         + ",\"cache_creation_input_tokens\":7,\"cache_read_input_tokens\":51234}}}";
+  }
+
+  private static String user(String text) {
+    return new JsonObject()
+        .put("type", "user")
+        .put("cwd", "/workspace/qits-qits")
+        .put("message", new JsonObject().put("role", "user").put("content", text))
+        .encode();
+  }
+
+  private static String userBlocks(String text) {
+    return new JsonObject()
+        .put("type", "user")
+        .put("cwd", "/workspace/qits-qits")
+        .put(
+            "message",
+            new JsonObject()
+                .put("role", "user")
+                .put(
+                    "content",
+                    new JsonArray()
+                        .add(new JsonObject().put("type", "text").put("text", text))))
+        .encode();
   }
 
   private static Map<String, AgentsDoors.UsageMessage> byId(AgentsDoors.UsageReport report) {
