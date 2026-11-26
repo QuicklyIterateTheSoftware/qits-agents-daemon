@@ -45,7 +45,7 @@
              qits-agents-service 2026.1124.93938 records byte-identical ones. -->
         <pact.version>4.7.5</pact.version>
         <qits.pact-consumer.version>2026.1106.507</qits.pact-consumer.version>
-        <qits.agents-golden-masters.version>2026.1126.152922</qits.agents-golden-masters.version>
+        <qits.agents-golden-masters.version>2026.1126.211128</qits.agents-golden-masters.version>
         <qits.projects-golden-masters.version>2026.1126.34009</qits.projects-golden-masters.version>
 
         <!-- Where the platform publishes it. Overridden by CI (-Dqits.maven.repository.url), derived
