@@ -46,7 +46,7 @@
         <pact.version>4.7.5</pact.version>
         <qits.pact-consumer.version>2026.1106.507</qits.pact-consumer.version>
         <qits.agents-golden-masters.version>2026.1125.234246</qits.agents-golden-masters.version>
-        <qits.projects-golden-masters.version>2026.1125.225323</qits.projects-golden-masters.version>
+        <qits.projects-golden-masters.version>2026.1126.34009</qits.projects-golden-masters.version>
 
         <!-- Where the platform publishes it. Overridden by CI (-Dqits.maven.repository.url), derived
              from QITS_DOMAIN; the default below is the public host. -->
