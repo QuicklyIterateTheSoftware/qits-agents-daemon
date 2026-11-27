@@ -11,7 +11,7 @@
          is green from this repository with Maven Central plus the platform's Maven registry. -->
     <groupId>eu.wohlben.qits</groupId>
     <artifactId>qits-agents-daemon-reactor</artifactId>
-    <version>2026.1127.2440</version>
+    <version>2026.1127.84047</version>
     <packaging>pom</packaging>
 
     <modules>
